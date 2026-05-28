@@ -119,14 +119,15 @@ jobs:
         run: |
           ossutil64 config -e "${OSS_ENDPOINT}" -i "${OSS_ACCESS_KEY_ID}" -k "${OSS_ACCESS_KEY_SECRET}"
           ossutil64 cp ../tapdata-deploy-latest.tar.gz \
-            oss://${OSS_BUCKET_NAME}/deploy-config/tapdata-deploy-latest.tar.gz \
+            oss://${OSS_BUCKET_NAME}/deploy/tapdata-deploy-latest.tar.gz \
             --force
           ossutil64 cp ../tapdata-deploy-latest-checksum.txt \
-            oss://${OSS_BUCKET_NAME}/deploy-config/tapdata-deploy-latest-checksum.txt \
+            oss://${OSS_BUCKET_NAME}/deploy/tapdata-deploy-latest-checksum.txt \
             --force
           ossutil64 cp tap-deploy \
-            oss://${OSS_BUCKET_NAME}/deploy-config/tap-deploy \
+            oss://${OSS_BUCKET_NAME}/deploy/tap-deploy \
             --force 
           echo "Upload complete:"
-          echo "  oss://${OSS_BUCKET_NAME}/deploy-config/tapdata-deploy-latest.tar.gz"
-          echo "  oss://${OSS_BUCKET_NAME}/deploy-config/tapdata-deploy-latest-checksum.txt"
+          echo "  oss://${OSS_BUCKET_NAME}/deploy/tapdata-deploy-latest.tar.gz"
+          echo "  oss://${OSS_BUCKET_NAME}/deploy/tapdata-deploy-latest-checksum.txt"
+          echo "  oss://${OSS_BUCKET_NAME}/deploy/tap-deploy"
