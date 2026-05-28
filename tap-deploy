@@ -388,6 +388,7 @@ TAP_DEPLOY_HELM_RELEASE=${TAP_DEPLOY_HELM_RELEASE:-tapdata}
 TAP_DEPLOY_NAMESPACE=${TAP_DEPLOY_NAMESPACE:-tapdata}
 TAP_DEPLOY_IMAGE_TAG=${TAP_DEPLOY_IMAGE_TAG:-latest}
 TAP_DEPLOY_IMAGE_REGISTRY=${TAP_DEPLOY_IMAGE_REGISTRY:-}
+TAP_DEPLOY_IMAGE_PULL_SECRET_NAME=${TAP_DEPLOY_IMAGE_PULL_SECRET_NAME:-tapdata-registry-auth}
 TAP_DEPLOY_MONGO_URI=${TAP_DEPLOY_MONGO_URI:-}
 TAP_DEPLOY_MONGO_USER=${TAP_DEPLOY_MONGO_USER:-root}
 TAP_DEPLOY_MONGO_PASSWORD=${TAP_DEPLOY_MONGO_PASSWORD:-}
@@ -418,6 +419,8 @@ TAP_DEPLOY_CLOUD_REGISTRY_ORG=${TAP_DEPLOY_CLOUD_REGISTRY_ORG:-}
 TAP_DEPLOY_CLOUD_REGISTRY_REPO=${TAP_DEPLOY_CLOUD_REGISTRY_REPO:-}
 TAP_DEPLOY_CLOUD_REGISTRY_REGION=${TAP_DEPLOY_CLOUD_REGISTRY_REGION:-}
 TAP_DEPLOY_CLOUD_REGISTRY_PROVIDER=${TAP_DEPLOY_CLOUD_REGISTRY_PROVIDER:-}
+TAP_DEPLOY_CLOUD_REGISTRY_AUTH_DOCKER_LOGIN=${TAP_DEPLOY_CLOUD_REGISTRY_AUTH_DOCKER_LOGIN:-}
+TAP_DEPLOY_CLOUD_REGISTRY_AUTH_EXPIRE_AT=${TAP_DEPLOY_CLOUD_REGISTRY_AUTH_EXPIRE_AT:-}
 EOF
   elif [ "$TAP_DEPLOY_MODE" = "on-prem" ]; then
     cat >> "$CONFIG_FILE" <<EOF
@@ -872,13 +875,13 @@ _render_helm_values() {
 
   # Set Helm template variables
   IMAGE_REGISTRY="${TAP_DEPLOY_IMAGE_REGISTRY:-}"
+  IMAGE_PULL_SECRET_NAME="${TAP_DEPLOY_IMAGE_PULL_SECRET_NAME:-tapdata-registry-auth}"
   MONGODB_USER="${TAP_DEPLOY_MONGO_USER:-root}"
   MONGODB_PASSWORD="${TAP_DEPLOY_MONGO_PASSWORD:-AbcDef123}"
   MONGODB_MEMBERS="${MONGODB_MEMBERS:-3}"
   MONGODB_STORAGE_CLASS="${MONGODB_STORAGE_CLASS:-}"
   TZ="${TAP_DEPLOY_TZ:-Asia/Shanghai}"
   LICENSE_HOST="${TAP_DEPLOY_LICENSE_HOST:-}"
-  IMAGE_TAG="${IMAGE_TAG:-latest}"
   APISERVER_ENABLED="${APISERVER_ENABLED:-true}"
   INGRESS_ENABLED="${INGRESS_ENABLED:-false}"
   INGRESS_CLASS_NAME="${INGRESS_CLASS_NAME:-}"
@@ -935,19 +938,57 @@ _render_helm_values() {
 
   # Image pull secret
   if [ "$TAP_DEPLOY_MODE" = "cloud" ] && [ -n "$cloud_registry_inner" ]; then
-    # Cloud mode: K8s nodes in same VPC can pull from inner URL without explicit pull secret
-    # for Huawei SWR; for AWS ECR, IAM roles on nodes handle auth
+    # Cloud mode: use SWR temporary authentication credentials
+    # Parse username and password from docker login command
+    # Format: docker login -u SWRDOM@<org> -p <token> <registry>
     IMAGE_PULL_SECRET_ENABLED="true"
     IMAGE_PULL_SECRET_REGISTRY="$cloud_registry_inner"
+    IMAGE_PULL_SECRET_NAME="${TAP_DEPLOY_IMAGE_PULL_SECRET_NAME:-tapdata-registry-auth}"
+    
+    # Extract username and password from auth_docker_login command
+    local auth_login_cmd="${TAP_DEPLOY_CLOUD_REGISTRY_AUTH_DOCKER_LOGIN:-}"
+    if [ -n "$auth_login_cmd" ]; then
+      # Parse username (after -u flag) - compatible with both GNU and BSD grep
+      IMAGE_PULL_SECRET_USERNAME=$(echo "$auth_login_cmd" | grep -o '\-u [^ ]*' | awk '{print $2}' || echo "")
+      # Parse password (after -p flag) - compatible with both GNU and BSD grep
+      IMAGE_PULL_SECRET_PASSWORD=$(echo "$auth_login_cmd" | grep -o '\-p [^ ]*' | awk '{print $2}' || echo "")
+      
+      if [ -z "$IMAGE_PULL_SECRET_USERNAME" ] || [ -z "$IMAGE_PULL_SECRET_PASSWORD" ]; then
+        log_warn "Failed to parse SWR credentials from docker login command, using AK/SK as fallback"
+        IMAGE_PULL_SECRET_USERNAME="${TAP_DEPLOY_CLOUD_ACCESS_KEY:-}"
+        IMAGE_PULL_SECRET_PASSWORD="${TAP_DEPLOY_CLOUD_SECRET_KEY:-}"
+      fi
+    else
+      # Fallback to AK/SK if auth command not available
+      log_warn "SWR auth docker login command not available, using AK/SK as fallback"
+      IMAGE_PULL_SECRET_USERNAME="${TAP_DEPLOY_CLOUD_ACCESS_KEY:-}"
+      IMAGE_PULL_SECRET_PASSWORD="${TAP_DEPLOY_CLOUD_SECRET_KEY:-}"
+    fi
+    
+    # Set imagePullSecrets array for deployment references
+    # Huawei Cloud CCE: use both default-secret (cloud platform) and custom registry auth
+    # This provides dual insurance - either secret can be used to pull images from SWR
+    IMAGE_PULL_SECRETS_ARRAY="[\"default-secret\", \"${IMAGE_PULL_SECRET_NAME}\"]"
+    
   elif [ -n "$IMAGE_REGISTRY" ]; then
     IMAGE_PULL_SECRET_ENABLED="true"
     IMAGE_PULL_SECRET_REGISTRY="$IMAGE_REGISTRY"
+    IMAGE_PULL_SECRET_NAME="${TAP_DEPLOY_IMAGE_PULL_SECRET_NAME:-tapdata-registry-auth}"
+    IMAGE_PULL_SECRET_USERNAME="${TAP_DEPLOY_CLOUD_ACCESS_KEY:-${IMAGE_PULL_SECRET_USERNAME:-}}"
+    IMAGE_PULL_SECRET_PASSWORD="${TAP_DEPLOY_CLOUD_SECRET_KEY:-${IMAGE_PULL_SECRET_PASSWORD:-}}"
+    
+    # Set imagePullSecrets array for deployment references
+    IMAGE_PULL_SECRETS_ARRAY="[\"${IMAGE_PULL_SECRET_NAME}\"]"
+    
   else
     IMAGE_PULL_SECRET_ENABLED="false"
     IMAGE_PULL_SECRET_REGISTRY=""
+    IMAGE_PULL_SECRET_USERNAME=""
+    IMAGE_PULL_SECRET_PASSWORD=""
+    
+    # No image pull secrets needed
+    IMAGE_PULL_SECRETS_ARRAY="[]"
   fi
-  IMAGE_PULL_SECRET_USERNAME="${TAP_DEPLOY_CLOUD_ACCESS_KEY:-${IMAGE_PULL_SECRET_USERNAME:-}}"
-  IMAGE_PULL_SECRET_PASSWORD="${TAP_DEPLOY_CLOUD_SECRET_KEY:-${IMAGE_PULL_SECRET_PASSWORD:-}}"
 
   # Application config variables
   MONGODB_CONNECTION_STRING="${MONGODB_CONNECTION_STRING:-}"
@@ -1254,17 +1295,21 @@ _apply_cloud() {
   registry_auth_info=$(terraform output -json registry_auth_info)
 
   # Parse auth info (extract fields from JSON)
-  local registry_org registry_repo registry_region registry_provider
+  local registry_org registry_repo registry_region registry_provider auth_docker_login auth_expire_at
   if command -v python3 &>/dev/null; then
     registry_org=$(echo "$registry_auth_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['organization'])" 2>/dev/null || echo "")
     registry_repo=$(echo "$registry_auth_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['repository'])" 2>/dev/null || echo "")
     registry_region=$(echo "$registry_auth_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['region'])" 2>/dev/null || echo "")
     registry_provider=$(echo "$registry_auth_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['provider'])" 2>/dev/null || echo "")
+    auth_docker_login=$(echo "$registry_auth_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['auth_docker_login'])" 2>/dev/null || echo "")
+    auth_expire_at=$(echo "$registry_auth_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['auth_expire_at'])" 2>/dev/null || echo "")
   elif command -v jq &>/dev/null; then
     registry_org=$(echo "$registry_auth_info" | jq -r '.organization' 2>/dev/null || echo "")
     registry_repo=$(echo "$registry_auth_info" | jq -r '.repository' 2>/dev/null || echo "")
     registry_region=$(echo "$registry_auth_info" | jq -r '.region' 2>/dev/null || echo "")
     registry_provider=$(echo "$registry_auth_info" | jq -r '.provider' 2>/dev/null || echo "")
+    auth_docker_login=$(echo "$registry_auth_info" | jq -r '.auth_docker_login' 2>/dev/null || echo "")
+    auth_expire_at=$(echo "$registry_auth_info" | jq -r '.auth_expire_at' 2>/dev/null || echo "")
   else
     log_error "python3 or jq is required to parse Terraform output. Please install one of them."
   fi
@@ -1273,6 +1318,8 @@ _apply_cloud() {
   log_info "Registry external push URL: $registry_external_push_url"
   log_info "Registry organization: $registry_org"
   log_info "Registry repository: $registry_repo"
+  log_info "Auth docker login command: $auth_docker_login"
+  log_info "Auth expire at: $auth_expire_at"
 
   # Save registry info to config for later use
   TAP_DEPLOY_CLOUD_REGISTRY_INNER_PULL_URL="$registry_inner_pull_url"
@@ -1281,6 +1328,8 @@ _apply_cloud() {
   TAP_DEPLOY_CLOUD_REGISTRY_REPO="$registry_repo"
   TAP_DEPLOY_CLOUD_REGISTRY_REGION="$registry_region"
   TAP_DEPLOY_CLOUD_REGISTRY_PROVIDER="$registry_provider"
+  TAP_DEPLOY_CLOUD_REGISTRY_AUTH_DOCKER_LOGIN="$auth_docker_login"
+  TAP_DEPLOY_CLOUD_REGISTRY_AUTH_EXPIRE_AT="$auth_expire_at"
 
   # Phase 4: Push images to cloud registry
   log_step "Phase 4: Push images to cloud registry"
@@ -1300,7 +1349,7 @@ _apply_cloud() {
 
   # Wait for operator to be ready
   log_info "Waiting for MongoDB Operator to be ready..."
-  kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mongodb-community-operator -n mongodb --timeout=120s || true
+  kubectl wait --for=condition=ready pod -l name=mongodb-kubernetes-operator -n mongodb --timeout=120s || true
 
   # Phase 6: Re-render Helm values with cloud registry info and deploy
   log_step "Phase 6: Deploy TapData (Helm)"
@@ -1427,13 +1476,13 @@ _helm_install() {
     log_error "values.yaml not found in $WORK_DIR. Run '${DEPLOY_FILENAME} init' first."
   fi
 
-  helm install "$release" "$chart_dir" \
+  helm upgrade --install "$release" "$chart_dir" \
     --namespace "$namespace" \
     --create-namespace \
     -f "$values_file"
 
-  log_info "Waiting for pods to be ready..."
-  kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance="$release" -n "$namespace" --timeout=600s || true
+  log_info "Showing deployed pods..."
+  kubectl get pods -n "$namespace" || true
 }
 
 # ============================================================================

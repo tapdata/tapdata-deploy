@@ -46,17 +46,17 @@ output "registry_repository_name" {
 
 output "registry_inner_pull_url" {
   description = "Internal network pull image address of the registry"
-  value       = "swr.${var.region}.myhuaweicloud.com/${huaweicloud_swr_organization.main.name}/${huaweicloud_swr_repository.main.name}"
+  value       = "swr.${var.region}.myhuaweicloud.com/${huaweicloud_swr_organization.main.name}"
 }
 
 output "registry_external_push_url" {
   description = "External network push mirror address"
-  value       = "swr-api.${var.region}.myhuaweicloud.com/${huaweicloud_swr_organization.main.name}/${huaweicloud_swr_repository.main.name}"
+  value       = "swr-api.${var.region}.myhuaweicloud.com/${huaweicloud_swr_organization.main.name}"
 }
 
 output "registry_login_command" {
   description = "Registry docker login command"
-  value       = huaweicloud_swr_temporary_login_command.main.x_swr_docker_login
+  value       = "${huaweicloud_swr_temporary_login_command.main.x_swr_docker_login} swr.${var.region}.myhuaweicloud.com"
   sensitive   = true
 }
 
@@ -69,7 +69,7 @@ output "registry_auth_info" {
     external_push_url = "swr-api.${var.region}.myhuaweicloud.com/${huaweicloud_swr_organization.main.name}/${huaweicloud_swr_repository.main.name}"
     region            = var.region
     provider          = "huaweicloud"
-    auth              = huaweicloud_swr_temporary_login_command.main.x_swr_docker_login
+    auth_docker_login = "${huaweicloud_swr_temporary_login_command.main.x_swr_docker_login} swr.${var.region}.myhuaweicloud.com"
     auth_expire_at    = huaweicloud_swr_temporary_login_command.main.x_expire_at
     auth_description  = "⚠️ This authentication is temporary (expire at ${huaweicloud_swr_temporary_login_command.main.x_expire_at}). After deployment, please be sure to update it with long-term valid authentication information to avoid being unable to pull the image due to authentication expiration."
   }
