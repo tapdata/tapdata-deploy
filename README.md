@@ -33,7 +33,7 @@ TapData One-Deploy is the official automated deployment tool for TapData, provid
 
 ```bash
 # Download tap-deploy script
-curl -L https://github.com/tapdata/tapdata-deploy/releases/latest/download/tap-deploy -o tap-deploy
+curl -L https://resource.tapdata.net/deploy/tap-deploy -o tap-deploy
 chmod +x tap-deploy
 
 # View help

@@ -152,7 +152,8 @@ data "huaweicloud_cce_cluster" "main" {
 
 # Registry Organization (SWR for Huawei Cloud)
 resource "huaweicloud_swr_organization" "main" {
-  name = var.registry_organization != "" ? var.registry_organization : var.cluster_name
+  name    = var.registry_organization != "" ? var.registry_organization : var.cluster_name
+  region  = var.region
 }
 
 # Registry Repository (SWR for Huawei Cloud)
@@ -162,4 +163,9 @@ resource "huaweicloud_swr_repository" "main" {
   description  = "TapData container image repository"
   category     = "app_server"
   is_public    = false
+}
+
+resource "huaweicloud_swr_temporary_login_command" "main" {
+  region = var.region
+  enhanced = true
 }
