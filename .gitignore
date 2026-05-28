@@ -1,0 +1,17 @@
+.idea
+**/*.tfvars
+!**/*.tfvars.tmpl
+**/.terraform
+**/.terraform.tfstate.lock.info
+**/*lock.hcl
+**/*.tfstate
+**/*.tfstate.backup
+**/temp/
+**/logs/
+**/data/
+**/.DS_Store
+**/*.tgz
+**/*.tar.gz
+.tap-deploy.env
+deploy-on-kubernetes/values-*.yaml
+design.md

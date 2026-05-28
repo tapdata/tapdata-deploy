@@ -1,0 +1,1814 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# ============================================================================
+# TapData One-Deploy CLI
+# Unified deployment script for TapData containerized deployment
+# ============================================================================
+
+# ---- Global Variables ----
+WORK_DIR=$(pwd)
+DEPLOY_HOME=$(cd "$(dirname "$0")" && pwd)
+CONFIG_FILE="${WORK_DIR}/.tap-deploy.env"
+DEPLOY_CONFIG_URL="${TAP_DEPLOY_CONFIG_URL:-https://resource.tapdata.net/deploy-config/tapdata-deploy-latest.tar.gz}"
+TAP_DEPLOY_VERSION="1.0.0"
+
+# ---- OS/Arch Detection ----
+OS_NAME=$(uname -s)
+ARCH_NAME=$(uname -m)
+
+case "$OS_NAME" in
+  Linux)  PLATFORM="linux" ;;
+  Darwin) PLATFORM="darwin" ;;
+  *)      echo "ERROR: Unsupported OS: $OS_NAME"; exit 1 ;;
+esac
+
+case "$ARCH_NAME" in
+  x86_64|amd64) ARCH="amd64" ;;
+  aarch64|arm64) ARCH="arm64" ;;
+  *)            echo "ERROR: Unsupported architecture: $ARCH_NAME"; exit 1 ;;
+esac
+
+# ============================================================================
+# Docker Registry API Functions
+# ============================================================================
+
+# Fetch tags from Docker Registry HTTP API V2
+# Supports Docker Hub and other registries
+fetch_image_tags() {
+  local image="$1"
+  local limit="${2:-5}"
+  
+  check_cmd curl
+  check_cmd jq
+  
+  # Parse image name
+  local registry=""
+  local repo=""
+  local image_name="$image"
+  
+  if [[ "$image" == *"/"* ]]; then
+    # Check if it has a registry prefix
+    local first_part
+    first_part=$(echo "$image" | cut -d'/' -f1)
+    if [[ "$first_part" == *.* ]]; then
+      # Has registry (e.g., nexus.tapdata.net/...)
+      registry="$first_part"
+      repo=$(echo "$image" | cut -d'/' -f2-)
+    else
+      # Docker Hub (e.g., tapdata8/tapdata)
+      registry="registry-1.docker.io"
+      repo="$image"
+    fi
+  else
+    # Docker Hub library image (e.g., mongo)
+    registry="registry-1.docker.io"
+    repo="library/$image"
+  fi
+  
+  # Get authentication token for Docker Hub
+  local auth_header=""
+  if [ "$registry" = "registry-1.docker.io" ]; then
+    local token_url="https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull"
+    local token
+    token=$(curl -s "$token_url" | jq -r '.token' 2>/dev/null)
+    if [ -n "$token" ] && [ "$token" != "null" ]; then
+      auth_header="Authorization: Bearer $token"
+    else
+      log_warn "Failed to get Docker Hub token, trying without authentication"
+    fi
+  fi
+  
+  # Fetch tags
+  local tags_url="https://${registry}/v2/${repo}/tags/list?n=${limit}"
+  local response
+  
+  if [ -n "$auth_header" ]; then
+    response=$(curl -s -H "$auth_header" "$tags_url" 2>/dev/null)
+  else
+    response=$(curl -s "$tags_url" 2>/dev/null)
+  fi
+  
+  # Parse and return tags
+  local tags
+  tags=$(echo "$response" | jq -r '.tags[]' 2>/dev/null)
+  
+  if [ -z "$tags" ]; then
+    log_warn "Failed to fetch tags for $image"
+    return 1
+  fi
+  
+  echo "$tags"
+}
+
+# Prompt user to select an image tag
+prompt_image_tag() {
+  local image="$1"
+  local var_name="$2"
+  local default_limit="${3:-5}"
+  
+  log_info "Fetching available versions for $image ..."
+  
+  local tags
+  tags=$(fetch_image_tags "$image" "$default_limit")
+  
+  if [ $? -ne 0 ] || [ -z "$tags" ]; then
+    log_warn "Cannot fetch tags, using default: latest"
+    eval "$var_name=\"latest\""
+    return
+  fi
+  
+  # Display tags as options
+  local tag_array=()
+  while IFS= read -r tag; do
+    [ -n "$tag" ] && tag_array+=("$tag")
+  done <<< "$tags"
+  
+  if [ ${#tag_array[@]} -eq 0 ]; then
+    log_warn "No tags found, using default: latest"
+    eval "$var_name=\"latest\""
+    return
+  fi
+  
+  echo ""
+  printf '  Available versions for %s:\n' "$image"
+  local i
+  for i in "${!tag_array[@]}"; do
+    printf '    %d) %s\n' $((i + 1)) "${tag_array[$i]}"
+  done
+  printf '    %d) Use custom version\n' $((${#tag_array[@]} + 1))
+  printf '    %d) Use latest\n' $((${#tag_array[@]} + 2))
+  echo ""
+  
+  local choice
+  while true; do
+    printf '  Select version [1-%d]: ' $((${#tag_array[@]} + 2))
+    read -r choice
+    
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+      if [ "$choice" -ge 1 ] && [ "$choice" -le "${#tag_array[@]}" ]; then
+        SELECTED_IMAGE_TAG="${tag_array[$((choice - 1))]}"
+        return
+      elif [ "$choice" -eq $(( ${#tag_array[@]} + 1 )) ]; then
+        # Custom version
+        local custom_tag
+        prompt_input "Enter custom version" "" custom_tag
+        if [ -z "$custom_tag" ]; then
+          log_warn "Empty version, using latest"
+          SELECTED_IMAGE_TAG="latest"
+        else
+          SELECTED_IMAGE_TAG="$custom_tag"
+        fi
+        return
+      elif [ "$choice" -eq $(( ${#tag_array[@]} + 2 )) ]; then
+        SELECTED_IMAGE_TAG="latest"
+        return
+      fi
+    fi
+    printf '  Invalid selection, please try again\n'
+  done
+}
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+# Cross-platform date formatting
+_format_date() {
+  if [ "$PLATFORM" = "darwin" ]; then
+    date "$@"
+  else
+    date "$@"
+  fi
+}
+
+# Logging
+log_info() {
+  local timestamp
+  timestamp=$(_format_date '+%Y-%m-%d %H:%M:%S')
+  printf '\033[0;32m[%s] [INFO]\033[0m %s\n' "$timestamp" "$*"
+}
+
+log_warn() {
+  local timestamp
+  timestamp=$(_format_date '+%Y-%m-%d %H:%M:%S')
+  printf '\033[0;33m[%s] [WARN]\033[0m %s\n' "$timestamp" "$*" >&2
+}
+
+log_error() {
+  local timestamp
+  timestamp=$(_format_date '+%Y-%m-%d %H:%M:%S')
+  printf '\033[0;31m[%s] [ERROR]\033[0m %s\n' "$timestamp" "$*" >&2
+  exit 1
+}
+
+log_step() {
+  printf '\n\033[0;36m==>\033[0m %s\n' "$*"
+}
+
+log_step_sub() {
+  printf '  \033[0;36m-->\033[0m %s\n' "$*"
+}
+
+# Portable sed in-place editing (compatible with Linux and macOS)
+sed_inplace() {
+  local expr="$1"
+  local file="$2"
+  local tmp_file
+  tmp_file=$(mktemp)
+  sed -e "$expr" "$file" > "$tmp_file" && mv "$tmp_file" "$file"
+}
+
+# Check if a command exists
+check_cmd() {
+  if ! command -v "$1" &>/dev/null; then
+    log_error "Required command '$1' not found. Please install it first."
+  fi
+}
+
+# Check if a command exists (non-fatal)
+has_cmd() {
+  command -v "$1" &>/dev/null
+}
+
+# Generate UUID
+gen_uuid() {
+  if [ "$PLATFORM" = "darwin" ]; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  else
+    cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())"
+  fi
+}
+
+# Read input with prompt
+prompt_input() {
+  local prompt="$1"
+  local default="${2:-}"
+  local var_name="$3"
+  local result
+
+  if [ -n "$default" ]; then
+    printf '  %s [%s]: ' "$prompt" "$default"
+  else
+    printf '  %s: ' "$prompt"
+  fi
+  read -r result
+
+  if [ -z "$result" ]; then
+    result="$default"
+  fi
+
+  eval "$var_name=\"\$result\""
+}
+
+# Read password (no echo)
+prompt_password() {
+  local prompt="$1"
+  local var_name="$2"
+  local result
+
+  printf '  %s: ' "$prompt"
+  if [ "$PLATFORM" = "darwin" ]; then
+    read -rs result
+  else
+    read -rs result
+  fi
+  echo
+  eval "$var_name=\"\$result\""
+}
+
+# Select from options
+prompt_select() {
+  local prompt="$1"
+  shift
+  local options=("$@")
+  local i
+
+  printf '  %s:\n' "$prompt"
+  for i in "${!options[@]}"; do
+    printf '    %d) %s\n' $((i + 1)) "${options[$i]}"
+  done
+
+  local choice
+  while true; do
+    printf '  Select [1-%d]: ' "${#options[@]}"
+    read -r choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
+      SELECTED_OPTION="${options[$((choice - 1))]}"
+      return
+    fi
+    printf '  Invalid selection, please try again
+'
+  done
+}
+
+# Yes/No confirmation
+prompt_confirm() {
+  local prompt="$1"
+  local default="${2:-n}"
+  local result
+
+  if [ "$default" = "y" ]; then
+    printf '  %s [Y/n]: ' "$prompt"
+  else
+    printf '  %s [y/N]: ' "$prompt"
+  fi
+  read -r result
+
+  case "$result" in
+    y|Y|yes|YES) return 0 ;;
+    n|N|no|NO)   return 1 ;;
+    "")
+      if [ "$default" = "y" ]; then return 0; else return 1; fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# ============================================================================
+# Template Rendering
+# ============================================================================
+
+# Render a template file by replacing {{VAR}} placeholders
+render_template() {
+  local src="$1"
+  local dst="$2"
+
+  if [ ! -f "$src" ]; then
+    log_error "Template file not found: $src"
+  fi
+
+  local tmp_file
+  tmp_file=$(mktemp)
+  cp "$src" "$tmp_file"
+
+  # Source config if it exists
+  if [ -f "$CONFIG_FILE" ]; then
+    set -a
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+    set +a
+  fi
+
+  # Find all {{VAR}} patterns and replace them
+  local vars
+  vars=$(grep -oE '\{\{[A-Za-z_][A-Za-z0-9_]*\}\}' "$tmp_file" 2>/dev/null | sort -u | sed 's/[{}]//g' || true)
+
+  for var in $vars; do
+    local val=""
+    # Use bash indirect variable expansion to get the value
+    val="${!var:-}"
+    # Escape special characters in val for sed replacement
+    local escaped_val
+    escaped_val=$(printf '%s\n' "$val" | sed 's/[&/\\]/\\&/g')
+    sed_inplace "s|{{${var}}}|${escaped_val}|g" "$tmp_file"
+  done
+
+  # Ensure destination directory exists
+  mkdir -p "$(dirname "$dst")"
+  mv "$tmp_file" "$dst"
+}
+
+# ============================================================================
+# Config File Management
+# ============================================================================
+
+save_config() {
+  cat > "$CONFIG_FILE" <<EOF
+# TapData Deploy Configuration
+# Generated by tap-deploy v${TAP_DEPLOY_VERSION}
+# Mode: ${TAP_DEPLOY_MODE}
+
+# --- General ---
+TAP_DEPLOY_MODE=${TAP_DEPLOY_MODE}
+TAP_DEPLOY_HELM_RELEASE=${TAP_DEPLOY_HELM_RELEASE:-tapdata}
+TAP_DEPLOY_NAMESPACE=${TAP_DEPLOY_NAMESPACE:-tapdata}
+TAP_DEPLOY_IMAGE_REGISTRY=${TAP_DEPLOY_IMAGE_REGISTRY:-}
+TAP_DEPLOY_MONGO_URI=${TAP_DEPLOY_MONGO_URI:-}
+TAP_DEPLOY_MONGO_USER=${TAP_DEPLOY_MONGO_USER:-root}
+TAP_DEPLOY_MONGO_PASSWORD=${TAP_DEPLOY_MONGO_PASSWORD:-}
+TAP_DEPLOY_ADMIN_PASSWORD=${TAP_DEPLOY_ADMIN_PASSWORD:-AbcDef123}
+TAP_DEPLOY_STORAGE_PATH=${TAP_DEPLOY_STORAGE_PATH:-}
+TAP_DEPLOY_TZ=${TAP_DEPLOY_TZ:-Asia/Shanghai}
+TAP_DEPLOY_JAVA_VERSION=${TAP_DEPLOY_JAVA_VERSION:-java17}
+TAP_DEPLOY_LICENSE_HOST=${TAP_DEPLOY_LICENSE_HOST:-}
+TAP_DEPLOY_UUID=${TAP_DEPLOY_UUID:-}
+EOF
+
+  # Append mode-specific config
+  if [ "$TAP_DEPLOY_MODE" = "cloud" ]; then
+    cat >> "$CONFIG_FILE" <<EOF
+
+# --- Cloud Specific ---
+TAP_DEPLOY_CLOUD_PROVIDER=${TAP_DEPLOY_CLOUD_PROVIDER:-huaweicloud}
+TAP_DEPLOY_CLOUD_REGION=${TAP_DEPLOY_CLOUD_REGION:-}
+TAP_DEPLOY_CLOUD_ACCESS_KEY=${TAP_DEPLOY_CLOUD_ACCESS_KEY:-}
+TAP_DEPLOY_CLOUD_SECRET_KEY=${TAP_DEPLOY_CLOUD_SECRET_KEY:-}
+TAP_DEPLOY_CLOUD_VPC_CIDR=${TAP_DEPLOY_CLOUD_VPC_CIDR:-172.16.0.0/16}
+TAP_DEPLOY_CLOUD_AZS=${TAP_DEPLOY_CLOUD_AZS:-}
+TAP_DEPLOY_CLOUD_CLUSTER_NAME=${TAP_DEPLOY_CLOUD_CLUSTER_NAME:-tapdata-k8s}
+TAP_DEPLOY_CLOUD_NODE_COUNT=${TAP_DEPLOY_CLOUD_NODE_COUNT:-2}
+TAP_DEPLOY_CLOUD_NEW_CLUSTER=${TAP_DEPLOY_CLOUD_NEW_CLUSTER:-true}
+TAP_DEPLOY_CLOUD_REGISTRY_INNER_PULL_URL=${TAP_DEPLOY_CLOUD_REGISTRY_INNER_PULL_URL:-}
+TAP_DEPLOY_CLOUD_REGISTRY_EXTERNAL_PUSH_URL=${TAP_DEPLOY_CLOUD_REGISTRY_EXTERNAL_PUSH_URL:-}
+TAP_DEPLOY_CLOUD_REGISTRY_ORG=${TAP_DEPLOY_CLOUD_REGISTRY_ORG:-}
+TAP_DEPLOY_CLOUD_REGISTRY_REPO=${TAP_DEPLOY_CLOUD_REGISTRY_REPO:-}
+TAP_DEPLOY_CLOUD_REGISTRY_REGION=${TAP_DEPLOY_CLOUD_REGISTRY_REGION:-}
+TAP_DEPLOY_CLOUD_REGISTRY_PROVIDER=${TAP_DEPLOY_CLOUD_REGISTRY_PROVIDER:-}
+EOF
+  elif [ "$TAP_DEPLOY_MODE" = "on-prem" ]; then
+    cat >> "$CONFIG_FILE" <<EOF
+
+# --- On-Prem Specific ---
+TAP_DEPLOY_OFFLINE=${TAP_DEPLOY_OFFLINE:-false}
+TAP_DEPLOY_BUNDLE_PATH=${TAP_DEPLOY_BUNDLE_PATH:-}
+TAP_DEPLOY_HARBOR_REGISTRY=${TAP_DEPLOY_HARBOR_REGISTRY:-}
+EOF
+  fi
+
+  log_info "Configuration saved to $CONFIG_FILE"
+}
+
+load_config() {
+  if [ ! -f "$CONFIG_FILE" ]; then
+    log_error "Configuration file not found: $CONFIG_FILE\nRun 'tap-deploy init' first."
+  fi
+
+  set -a
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+  set +a
+}
+
+# ============================================================================
+# Template Download
+# ============================================================================
+
+# Download templates from remote server
+# Downloads the archive to current directory, extracts into WORK_DIR/.tmp
+download_templates() {
+  local mode="$1"
+  local target_dir="${2:-$WORK_DIR}"
+
+  check_cmd curl
+  check_cmd tar
+
+  # Determine the local archive path (saved in current working directory)
+  local archive_name
+  archive_name=$(basename "$DEPLOY_CONFIG_URL")
+  local archive_path="$(pwd)/${archive_name}"
+
+  # Check if archive already exists in current directory
+  if [ -f "$archive_path" ]; then
+    log_info "Found existing archive: $archive_path, using it directly"
+  else
+    log_step "Downloading configuration templates from $DEPLOY_CONFIG_URL"
+    curl -fSL -o "$archive_path" "$DEPLOY_CONFIG_URL" || {
+      rm -f "$archive_path"
+      log_error "Failed to download templates from $DEPLOY_CONFIG_URL"
+    }
+    log_info "Archive saved to: $archive_path"
+  fi
+
+  # Extract into WORK_DIR/.tmp to keep working directory clean
+  local tmp_dir="${target_dir}/.tmp"
+  rm -rf "$tmp_dir"
+  mkdir -p "$tmp_dir"
+
+  tar -xzf "$archive_path" -C "$tmp_dir"
+
+  # Find the extracted directory (may be tapdata-deploy-*/ or just the content)
+  local extracted_dir
+  extracted_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "tapdata-deploy*" | head -1)
+  if [ -z "$extracted_dir" ]; then
+    extracted_dir="$tmp_dir"
+  fi
+
+  # Copy mode-specific templates
+  case "$mode" in
+    lite)
+      cp -r "$extracted_dir/deploy-on-docker" "$target_dir/deploy-on-docker"
+      cp -r "$extracted_dir/templates" "$target_dir/templates"
+      ;;
+    cloud)
+      cp -r "$extracted_dir/infrastructure" "$target_dir/infrastructure"
+      cp -r "$extracted_dir/deploy-on-kubernetes" "$target_dir/deploy-on-kubernetes"
+      cp -r "$extracted_dir/templates" "$target_dir/templates"
+      ;;
+    on-prem)
+      cp -r "$extracted_dir/deploy-on-kubernetes" "$target_dir/deploy-on-kubernetes"
+      cp -r "$extracted_dir/templates" "$target_dir/templates"
+      ;;
+  esac
+
+  # Clean up .tmp directory
+  rm -rf "$tmp_dir"
+  log_info "Templates extracted successfully"
+}
+
+# Get template source directory (downloaded during init)
+get_template_dir() {
+  local subdir="$1"
+
+  if [ -d "$WORK_DIR/$subdir" ]; then
+    echo "$WORK_DIR/$subdir"
+  elif [ -d "$DEPLOY_HOME/$subdir" ]; then
+    echo "$DEPLOY_HOME/$subdir"
+  else
+    log_error "Template directory not found: $subdir. Run 'tap-deploy init' first."
+  fi
+}
+
+# ============================================================================
+# INIT Command
+# ============================================================================
+
+cmd_init() {
+  log_step "TapData One-Deploy - Initialization Wizard"
+  echo ""
+
+  # Step 0: Confirm working directory
+  local confirmed_dir
+  prompt_input "Working directory" "$WORK_DIR" confirmed_dir
+  if [ -n "$confirmed_dir" ]; then
+    # Convert to absolute path
+    if [[ "$confirmed_dir" != /* ]]; then
+      confirmed_dir="$(pwd)/$confirmed_dir"
+    fi
+    mkdir -p "$confirmed_dir"
+    WORK_DIR="$(cd "$confirmed_dir" && pwd)"
+    CONFIG_FILE="${WORK_DIR}/.tap-deploy.env"
+  fi
+  log_info "Working directory set to: $WORK_DIR"
+  echo ""
+
+  # Step 0.1: Check for existing configuration
+  if [ -f "$CONFIG_FILE" ]; then
+    log_warn "Existing configuration found at $CONFIG_FILE"
+    if ! prompt_confirm "Clear existing configuration and re-initialize?" "n"; then
+      log_info "Initialization cancelled"
+      return 1
+    fi
+    # Clean working directory (keep downloaded archive files like .tar.gz)
+    log_info "Cleaning working directory (keeping archive files)..."
+    local item
+    for item in "$WORK_DIR"/*; do
+      case "$item" in
+        *.tar.gz|*.tgz|*.zip)
+          # Keep downloaded archive files
+          ;;
+        *)
+          rm -rf "$item"
+          ;;
+      esac
+    done
+    rm -f "$WORK_DIR/.tap-deploy.env"
+    log_info "Working directory cleaned"
+    echo ""
+  fi
+
+  # Step 1: Select deployment mode
+  prompt_select "Select deployment mode" \
+    "Lite (Docker) - Development, testing, quick POC" \
+    "Cloud (Terraform + Helm) - Cloud production environment" \
+    "On-Prem (K8s + Helm) - Private data center / air-gapped"
+
+  case "$SELECTED_OPTION" in
+    Lite*)  TAP_DEPLOY_MODE="lite" ;;
+    Cloud*) TAP_DEPLOY_MODE="cloud" ;;
+    On-Prem*) TAP_DEPLOY_MODE="on-prem" ;;
+  esac
+
+  # Step 2: Common parameters
+  #echo ""
+  #log_step "Configure common parameters"
+  #prompt_input "Admin Password" "AbcDef123" TAP_DEPLOY_ADMIN_PASSWORD
+  #prompt_input "Timezone" "Asia/Shanghai" TAP_DEPLOY_TZ
+  #prompt_input "JDK version (java8/java11/java17)" "java17" TAP_DEPLOY_JAVA_VERSION
+  #prompt_input "License server address" "" TAP_DEPLOY_LICENSE_HOST
+
+  # Generate UUID
+  TAP_DEPLOY_UUID=$(gen_uuid)
+
+  # Step 3: Mode-specific parameters
+  echo ""
+  case "$TAP_DEPLOY_MODE" in
+    lite)
+      _init_lite
+      ;;
+    cloud)
+      _init_cloud
+      ;;
+    on-prem)
+      _init_onprem
+      ;;
+  esac
+
+  # Step 4: Download templates
+  echo ""
+  log_step "Download configuration templates"
+  download_templates "$TAP_DEPLOY_MODE" "$WORK_DIR"
+
+  # Step 5: Render templates
+  echo ""
+  log_step "Render configuration files"
+  _render_configs
+
+  # Step 6: Save config
+  save_config
+
+  # Step 7: Next steps
+  echo ""
+  log_step "Initialization complete"
+  echo ""
+  echo "  Next steps:"
+  echo "    1. Review the generated configuration files"
+  echo "    2. Run 'bash tap-deploy plan'  to preview deployment"
+  echo "    3. Run 'bash tap-deploy apply'  to execute deployment"
+  echo ""
+}
+
+_init_lite() {
+  log_step "Configure Lite mode parameters"
+
+  prompt_input "MongoDB port mapping (host port)" "27006" MONGO_HOST_PORT
+  prompt_input "TapData port mapping (host port)" "13030" TAPDATA_HOST_PORT
+  
+  # Select TapData image version
+  prompt_image_tag "tapdata8/tapdata" "TAPDATA_TAG" 5
+  TAPDATA_IMAGE="tapdata8/tapdata:${SELECTED_IMAGE_TAG}"
+  
+  prompt_input "MongoDB username" "root" TAP_DEPLOY_MONGO_USER
+  prompt_input "MongoDB password" "" TAP_DEPLOY_MONGO_PASSWORD
+
+  TAP_DEPLOY_MONGO_URI=""
+  MONGODB_CONNECTION_STRING="mdb0:27017/tapdata?authSource=admin"
+  TAP_DEPLOY_NAMESPACE="tapdata"
+  TAP_DEPLOY_HELM_RELEASE="tapdata"
+  TAP_DEPLOY_IMAGE_REGISTRY=""
+  TAP_DEPLOY_STORAGE_PATH=""
+}
+
+_init_cloud() {
+  log_step "Configure Cloud mode parameters"
+
+  # Cloud provider
+  prompt_select "Select cloud provider" "Huawei Cloud" "AWS"
+  case "$SELECTED_OPTION" in
+    Huawei*) TAP_DEPLOY_CLOUD_PROVIDER="huaweicloud" ;;
+    AWS*)    TAP_DEPLOY_CLOUD_PROVIDER="aws" ;;
+  esac
+
+  echo ""
+  prompt_input "Region" "$([ "$TAP_DEPLOY_CLOUD_PROVIDER" = "huaweicloud" ] && echo 'cn-north-4' || echo 'ap-southeast-1')" TAP_DEPLOY_CLOUD_REGION
+  prompt_password "Access Key" TAP_DEPLOY_CLOUD_ACCESS_KEY
+  prompt_password "Secret Key" TAP_DEPLOY_CLOUD_SECRET_KEY
+  prompt_input "VPC CIDR" "172.16.0.0/16" TAP_DEPLOY_CLOUD_VPC_CIDR
+
+  # Availability zones
+  local default_azs
+  if [ "$TAP_DEPLOY_CLOUD_PROVIDER" = "huaweicloud" ]; then
+    default_azs="cn-north-4a,cn-north-4b"
+  else
+    default_azs="ap-southeast-1a,ap-southeast-1b"
+  fi
+  prompt_input "Availability zones (comma-separated)" "$default_azs" TAP_DEPLOY_CLOUD_AZS
+
+  # Cluster config
+  prompt_input "Cluster name" "tapdata-k8s" TAP_DEPLOY_CLOUD_CLUSTER_NAME
+  prompt_input "Worker node count" "2" TAP_DEPLOY_CLOUD_NODE_COUNT
+
+  if [ "$TAP_DEPLOY_CLOUD_PROVIDER" = "huaweicloud" ]; then
+    prompt_input "Node flavor (flavor_id)" "s6.large.2" CLOUD_NODE_FLAVOR
+    TAP_DEPLOY_CLOUD_NODE_FLAVOR="$CLOUD_NODE_FLAVOR"
+  else
+    prompt_input "Node instance type" "t3.medium" CLOUD_NODE_INSTANCE_TYPE
+    TAP_DEPLOY_CLOUD_NODE_INSTANCE_TYPE="$CLOUD_NODE_INSTANCE_TYPE"
+    prompt_input "K8s version" "1.29" CLOUD_CLUSTER_VERSION
+    TAP_DEPLOY_CLOUD_CLUSTER_VERSION="$CLOUD_CLUSTER_VERSION"
+  fi
+
+  prompt_input "Key pair name (leave empty to auto-create)" "" TAP_DEPLOY_CLOUD_KEY_PAIR_NAME
+  TAP_DEPLOY_CLOUD_NEW_CLUSTER="true"
+
+  # MongoDB and TapData config
+  echo ""
+  prompt_input "MongoDB username" "root" TAP_DEPLOY_MONGO_USER
+  prompt_input "MongoDB password" "AbcDef123" TAP_DEPLOY_MONGO_PASSWORD
+  prompt_input "Helm release name" "tapdata" TAP_DEPLOY_HELM_RELEASE
+  prompt_input "Namespace" "tapdata" TAP_DEPLOY_NAMESPACE
+  
+  # Select TapData image version
+  echo ""
+  prompt_image_tag "tapdata8/tapdata" "TAPDATA_TAG" 5
+  TAP_DEPLOY_IMAGE_TAG="${SELECTED_IMAGE_TAG}"
+  
+  # Image registry is automatically configured from Terraform outputs during apply
+  log_info "Image registry will be automatically configured from cloud provider after infrastructure creation"
+}
+
+_init_onprem() {
+  log_step "Configure On-Prem mode parameters"
+
+  # Online or offline
+  if prompt_confirm "Is this an air-gapped/offline environment?" "n"; then
+    TAP_DEPLOY_OFFLINE="true"
+  else
+    TAP_DEPLOY_OFFLINE="false"
+  fi
+
+  prompt_input "MongoDB username" "root" TAP_DEPLOY_MONGO_USER
+  prompt_input "MongoDB password" "AbcDef123" TAP_DEPLOY_MONGO_PASSWORD
+  prompt_input "Helm release name" "tapdata" TAP_DEPLOY_HELM_RELEASE
+  prompt_input "Namespace" "tapdata" TAP_DEPLOY_NAMESPACE
+
+  if [ "$TAP_DEPLOY_OFFLINE" = "true" ]; then
+    prompt_input "Internal image registry URL (Harbor/SWR etc.)" "" TAP_DEPLOY_HARBOR_REGISTRY
+    TAP_DEPLOY_IMAGE_REGISTRY="$TAP_DEPLOY_HARBOR_REGISTRY"
+  else
+    prompt_input "Image registry prefix (leave empty for Docker Hub)" "" TAP_DEPLOY_IMAGE_REGISTRY
+  fi
+
+  TAP_DEPLOY_CLOUD_KEY_PAIR_NAME=""
+}
+
+# Render configuration files based on mode
+_render_configs() {
+  local tmpl_dir
+
+  # Render common application config
+  tmpl_dir=$(get_template_dir "templates")
+
+  # application.yml
+  render_template "$tmpl_dir/application.yml.tmpl" "$WORK_DIR/application.yml"
+  log_info "Generated: application.yml"
+
+  # agent.yml
+  render_template "$tmpl_dir/agent.yml.tmpl" "$WORK_DIR/agent.yml"
+  log_info "Generated: agent.yml"
+
+  case "$TAP_DEPLOY_MODE" in
+    lite)
+      _render_lite_configs
+      ;;
+    cloud)
+      _render_cloud_configs
+      ;;
+    on-prem)
+      _render_onprem_configs
+      ;;
+  esac
+}
+
+_render_lite_configs() {
+  local tmpl_dir
+  tmpl_dir=$(get_template_dir "deploy-on-docker")
+
+  # Set template variables for Lite mode
+  MONGO_HOST_PORT="${MONGO_HOST_PORT:-27006}"
+  TAPDATA_HOST_PORT="${TAPDATA_HOST_PORT:-13030}"
+  TAPDATA_IMAGE="${TAPDATA_IMAGE:-tapdata8/tapdata:latest}"
+  TAPDATA_TAG="$(echo "$TAPDATA_IMAGE" | cut -d':' -f2)"
+  MONGODB_USER="${TAP_DEPLOY_MONGO_USER:-root}"
+  MONGODB_PASSWORD="${TAP_DEPLOY_MONGO_PASSWORD:-}"
+  TZ="${TAP_DEPLOY_TZ:-Asia/Shanghai}"
+  JAVA_VERSION="${TAP_DEPLOY_JAVA_VERSION:-java17}"
+  LICENSE_HOST="${TAP_DEPLOY_LICENSE_HOST:-}"
+
+  render_template "$tmpl_dir/docker-compose.yaml.tmpl" "$WORK_DIR/docker-compose.yaml"
+  log_info "Generated: docker-compose.yaml"
+
+  # Copy supporting files that don't need rendering
+  local docker_dir
+  docker_dir=$(get_template_dir "deploy-on-docker")
+
+  mkdir -p "$WORK_DIR/mongodb/config" "$WORK_DIR/mongodb/initdb.d" "$WORK_DIR/tapdata/logs"
+  cp -n "$docker_dir/mongodb/startup.sh" "$WORK_DIR/mongodb/startup.sh" 2>/dev/null || true
+  cp -rn "$docker_dir/mongodb/config/"* "$WORK_DIR/mongodb/config/" 2>/dev/null || true
+  cp -n "$docker_dir/tapdata/docker-entrypoint.sh" "$WORK_DIR/tapdata/docker-entrypoint.sh" 2>/dev/null || true
+}
+
+_render_cloud_configs() {
+  # Render Terraform tfvars
+  local infra_dir
+  infra_dir=$(get_template_dir "infrastructure")
+  local provider="${TAP_DEPLOY_CLOUD_PROVIDER:-huaweicloud}"
+
+  # Set Terraform template variables
+  CLOUD_REGION="${TAP_DEPLOY_CLOUD_REGION:-}"
+  CLOUD_ACCESS_KEY="${TAP_DEPLOY_CLOUD_ACCESS_KEY:-}"
+  CLOUD_SECRET_KEY="${TAP_DEPLOY_CLOUD_SECRET_KEY:-}"
+
+  # Convert comma-separated AZs to Terraform list format
+  local azs_raw="${TAP_DEPLOY_CLOUD_AZS:-}"
+  CLOUD_AZS=""
+  if [ -n "$azs_raw" ]; then
+    local first=true
+    IFS=',' read -ra az_array <<< "$azs_raw"
+    for az in "${az_array[@]}"; do
+      az=$(echo "$az" | xargs) # trim whitespace
+      if [ "$first" = true ]; then
+        CLOUD_AZS="\"$az\""
+        first=false
+      else
+        CLOUD_AZS="$CLOUD_AZS, \"$az\""
+      fi
+    done
+  fi
+
+  CLOUD_CLUSTER_NAME="${TAP_DEPLOY_CLOUD_CLUSTER_NAME:-tapdata-k8s}"
+  CLOUD_NODE_COUNT="${TAP_DEPLOY_CLOUD_NODE_COUNT:-2}"
+  CLOUD_KEY_PAIR_NAME="${TAP_DEPLOY_CLOUD_KEY_PAIR_NAME:-}"
+
+  if [ "$provider" = "huaweicloud" ]; then
+    CLOUD_NODE_FLAVOR="${TAP_DEPLOY_CLOUD_NODE_FLAVOR:-s6.large.2}"
+    render_template "$infra_dir/huaweicloud/terraform.tfvars.tmpl" "$WORK_DIR/infrastructure/huaweicloud/terraform.tfvars"
+    log_info "Generated: infrastructure/huaweicloud/terraform.tfvars"
+
+    # Copy Terraform source files (not templates)
+    mkdir -p "$WORK_DIR/infrastructure/huaweicloud"
+    cp "$infra_dir/huaweicloud/"*.tf "$WORK_DIR/infrastructure/huaweicloud/" 2>/dev/null || true
+  else
+    CLOUD_CLUSTER_VERSION="${TAP_DEPLOY_CLOUD_CLUSTER_VERSION:-1.29}"
+    CLOUD_NODE_INSTANCE_TYPE="${TAP_DEPLOY_CLOUD_NODE_INSTANCE_TYPE:-t3.medium}"
+    render_template "$infra_dir/aws/terraform.tfvars.tmpl" "$WORK_DIR/infrastructure/aws/terraform.tfvars"
+    log_info "Generated: infrastructure/aws/terraform.tfvars"
+
+    mkdir -p "$WORK_DIR/infrastructure/aws"
+    cp "$infra_dir/aws/"*.tf "$WORK_DIR/infrastructure/aws/" 2>/dev/null || true
+  fi
+
+  # Render Helm values
+  _render_helm_values
+}
+
+_render_cloud_configs() {
+  # Re-render Helm values with cloud registry info (called during apply after TF outputs are available)
+  _render_helm_values
+}
+
+_render_onprem_configs() {
+  _render_helm_values
+}
+
+_render_helm_values() {
+  local k8s_dir
+  k8s_dir=$(get_template_dir "deploy-on-kubernetes")
+
+  # Set Helm template variables
+  IMAGE_REGISTRY="${TAP_DEPLOY_IMAGE_REGISTRY:-}"
+  MONGODB_USER="${TAP_DEPLOY_MONGO_USER:-root}"
+  MONGODB_PASSWORD="${TAP_DEPLOY_MONGO_PASSWORD:-AbcDef123}"
+  MONGODB_MEMBERS="${MONGODB_MEMBERS:-3}"
+  MONGODB_STORAGE_CLASS="${MONGODB_STORAGE_CLASS:-}"
+  TZ="${TAP_DEPLOY_TZ:-Asia/Shanghai}"
+  LICENSE_HOST="${TAP_DEPLOY_LICENSE_HOST:-}"
+  IMAGE_TAG="${IMAGE_TAG:-latest}"
+  APISERVER_ENABLED="${APISERVER_ENABLED:-true}"
+  INGRESS_ENABLED="${INGRESS_ENABLED:-false}"
+  INGRESS_CLASS_NAME="${INGRESS_CLASS_NAME:-}"
+
+  # Replica counts
+  SERVER_REPLICA_COUNT="${SERVER_REPLICA_COUNT:-2}"
+  ENGINE_REPLICA_COUNT="${ENGINE_REPLICA_COUNT:-2}"
+  APISERVER_REPLICA_COUNT="${APISERVER_REPLICA_COUNT:-2}"
+
+  # Image repositories
+  local image_tag="${TAP_DEPLOY_IMAGE_TAG:-latest}"
+  if [ "$TAP_DEPLOY_MODE" = "cloud" ] && [ -n "$TAP_DEPLOY_CLOUD_REGISTRY_INNER_PULL_URL" ]; then
+    # Cloud mode: use inner pull URL from Terraform outputs
+    # Images were pushed with specific version tag to cloud registry
+    SERVER_IMAGE_REPOSITORY="${TAP_DEPLOY_CLOUD_REGISTRY_INNER_PULL_URL}/tapdata"
+    ENGINE_IMAGE_REPOSITORY="${TAP_DEPLOY_CLOUD_REGISTRY_INNER_PULL_URL}/tapdata"
+    APISERVER_IMAGE_REPOSITORY="${TAP_DEPLOY_CLOUD_REGISTRY_INNER_PULL_URL}/tapdata"
+    KUBECTL_IMAGE_REPOSITORY="${TAP_DEPLOY_CLOUD_REGISTRY_INNER_PULL_URL}/kubectl"
+  elif [ -n "$IMAGE_REGISTRY" ]; then
+    SERVER_IMAGE_REPOSITORY="${IMAGE_REGISTRY}/tapdata/tapdata"
+    ENGINE_IMAGE_REPOSITORY="${IMAGE_REGISTRY}/tapdata/tapdata"
+    APISERVER_IMAGE_REPOSITORY="${IMAGE_REGISTRY}/tapdata/tapdata"
+    KUBECTL_IMAGE_REPOSITORY="${IMAGE_REGISTRY}/tapdata/kubectl"
+  else
+    SERVER_IMAGE_REPOSITORY="tapdata8/tapdata"
+    ENGINE_IMAGE_REPOSITORY="tapdata8/tapdata"
+    APISERVER_IMAGE_REPOSITORY="tapdata8/tapdata"
+    KUBECTL_IMAGE_REPOSITORY="bitnami/kubectl"
+  fi
+  
+  # Set IMAGE_TAG for Helm values
+  IMAGE_TAG="${image_tag}"
+
+  # Service type and NodePort
+  if [ "$TAP_DEPLOY_MODE" = "cloud" ] && [ "${TAP_DEPLOY_CLOUD_PROVIDER:-}" = "huaweicloud" ]; then
+    SERVER_SERVICE_TYPE="NodePort"
+    SERVER_NODEPORT_CONFIG="nodePort: 30303"
+    APISERVER_SERVICE_TYPE="NodePort"
+    APISERVER_NODEPORT_CONFIG="nodePort: 30803"
+    INGRESS_ENABLED="true"
+    INGRESS_CLASS_NAME="cce"
+    MONGODB_STORAGE_CLASS="ssd"
+  else
+    SERVER_SERVICE_TYPE="ClusterIP"
+    SERVER_NODEPORT_CONFIG=""
+    APISERVER_SERVICE_TYPE="ClusterIP"
+    APISERVER_NODEPORT_CONFIG=""
+  fi
+
+  # MongoDB hosts
+  MONGODB_HOSTS="tapdata-mongodb-0.tapdata-mongodb-svc:27017,tapdata-mongodb-1.tapdata-mongodb-svc:27017,tapdata-mongodb-2.tapdata-mongodb-svc:27017"
+
+  # Image pull secret
+  if [ "$TAP_DEPLOY_MODE" = "cloud" ] && [ -n "$TAP_DEPLOY_CLOUD_REGISTRY_INNER_PULL_URL" ]; then
+    # Cloud mode: K8s nodes in same VPC can pull from inner URL without explicit pull secret
+    # for Huawei SWR; for AWS ECR, IAM roles on nodes handle auth
+    IMAGE_PULL_SECRET_ENABLED="true"
+    IMAGE_PULL_SECRET_REGISTRY="$TAP_DEPLOY_CLOUD_REGISTRY_INNER_PULL_URL"
+  elif [ -n "$IMAGE_REGISTRY" ]; then
+    IMAGE_PULL_SECRET_ENABLED="true"
+    IMAGE_PULL_SECRET_REGISTRY="$IMAGE_REGISTRY"
+  else
+    IMAGE_PULL_SECRET_ENABLED="false"
+    IMAGE_PULL_SECRET_REGISTRY=""
+  fi
+  IMAGE_PULL_SECRET_USERNAME="${TAP_DEPLOY_CLOUD_ACCESS_KEY:-${IMAGE_PULL_SECRET_USERNAME:-}}"
+  IMAGE_PULL_SECRET_PASSWORD="${TAP_DEPLOY_CLOUD_SECRET_KEY:-${IMAGE_PULL_SECRET_PASSWORD:-}}"
+
+  # Application config variables
+  MONGODB_CONNECTION_STRING="${MONGODB_CONNECTION_STRING:-}"
+  TAPDATA_MODE="${TAPDATA_MODE:-cluster}"
+  TAPDATA_BASE_URLS="${TAPDATA_BASE_URLS:-http://127.0.0.1:3030/api/}"
+  TAPDATA_BACKEND_URL="${TAPDATA_BACKEND_URL:-http://127.0.0.1:3030/api/}"
+  TAPDATA_UUID="${TAP_DEPLOY_UUID:-}"
+
+  render_template "$k8s_dir/values.yaml.tmpl" "$WORK_DIR/values.yaml"
+  log_info "Generated: values.yaml"
+
+  # Copy Helm chart files
+  if [ ! -d "$WORK_DIR/deploy-on-kubernetes" ]; then
+    cp -r "$k8s_dir" "$WORK_DIR/deploy-on-kubernetes"
+    # Remove template file from the copy
+    rm -f "$WORK_DIR/deploy-on-kubernetes/values.yaml.tmpl"
+  fi
+}
+
+# ============================================================================
+# PLAN Command
+# ============================================================================
+
+cmd_plan() {
+  load_config
+
+  log_step "Deployment preview - Mode: $TAP_DEPLOY_MODE"
+  echo ""
+
+  case "$TAP_DEPLOY_MODE" in
+    lite)
+      echo "Deployment mode: Lite (Docker Compose)"
+      echo "├── MongoDB (mongo:6.0)"
+      echo "│   └── Single-node replica set, port ${MONGO_HOST_PORT:-27006}:27017"
+      echo "└── TapData (${TAPDATA_IMAGE:-tapdata8/tapdata:latest})"
+      echo "    └── Full mode, port ${TAPDATA_HOST_PORT:-13030}:3030"
+      echo ""
+      echo "Configuration files:"
+      echo "  - docker-compose.yaml"
+      echo "  - application.yml"
+      echo "  - agent.yml"
+      ;;
+    cloud)
+      local provider="${TAP_DEPLOY_CLOUD_PROVIDER:-huaweicloud}"
+      echo "Deployment mode: Cloud (Terraform + Helm)"
+      echo ""
+      echo "Phase 1: Infrastructure (Terraform)"
+      if [ "$provider" = "huaweicloud" ]; then
+        echo "├── VPC (${TAP_DEPLOY_CLOUD_VPC_CIDR:-172.16.0.0/16})"
+        echo "├── CCE cluster (${TAP_DEPLOY_CLOUD_CLUSTER_NAME:-tapdata-k8s})"
+        echo "├── Node pool (${TAP_DEPLOY_CLOUD_NODE_COUNT:-2} x ${TAP_DEPLOY_CLOUD_NODE_FLAVOR:-s6.large.2})"
+        echo "├── ELB + EIP"
+        echo "└── Security group"
+      else
+        echo "├── VPC (${TAP_DEPLOY_CLOUD_VPC_CIDR:-172.16.0.0/16})"
+        echo "├── EKS cluster (${TAP_DEPLOY_CLOUD_CLUSTER_NAME:-tapdata-k8s})"
+        echo "├── Node group (${TAP_DEPLOY_CLOUD_NODE_COUNT:-2} x ${TAP_DEPLOY_CLOUD_NODE_INSTANCE_TYPE:-t3.medium})"
+        echo "└── Security group"
+      fi
+      echo ""
+      echo "Phase 2: Configure Kubeconfig"
+      echo ""
+      echo "Phase 3: Retrieve image registry information from Terraform outputs"
+      echo ""
+      echo "Phase 4: Push images to cloud registry"
+      echo "├── tapdata (tapdata8/tapdata:latest -> cloud-registry/tapdata:latest)"
+      echo "└── kubectl (bitnami/kubectl:latest -> cloud-registry/kubectl:latest)"
+      echo ""
+      echo "Phase 5: Install MongoDB Operator"
+      echo ""
+      echo "Phase 6: Deploy TapData (Helm)"
+      echo "├── MongoDB (3-node replica set)"
+      echo "├── tapdata-server (2 replicas, port 3030)"
+      echo "├── tapdata-engine (2 replicas)"
+      echo "└── tapdata-apiserver (2 replicas, port 3080)"
+      ;;
+    on-prem)
+      echo "Deployment mode: On-Prem (K8s + Helm)"
+      echo ""
+      if [ "${TAP_DEPLOY_OFFLINE:-false}" = "true" ]; then
+        echo "Offline deployment: Yes"
+        echo "Image registry: ${TAP_DEPLOY_HARBOR_REGISTRY:-Not configured}"
+        echo ""
+        echo "Step 1: Load offline images and push to ${TAP_DEPLOY_HARBOR_REGISTRY:-internal registry}"
+        echo "Step 2: Deploy TapData"
+      fi
+      echo "Helm deployment components:"
+      echo "├── MongoDB (3-node replica set)"
+      echo "├── tapdata-server (2 replicas, port 3030)"
+      echo "├── tapdata-engine (2 replicas)"
+      echo "└── tapdata-apiserver (2 replicas, port 3080)"
+      ;;
+  esac
+
+  echo ""
+  echo "Run 'bash tap-deploy apply' to execute deployment"
+}
+
+# ============================================================================
+# APPLY Command
+# ============================================================================
+
+cmd_apply() {
+  load_config
+
+  log_step "Execute deployment - Mode: $TAP_DEPLOY_MODE"
+  echo ""
+
+  case "$TAP_DEPLOY_MODE" in
+    lite)    _apply_lite ;;
+    cloud)   _apply_cloud ;;
+    on-prem) _apply_onprem ;;
+  esac
+}
+
+_apply_lite() {
+  check_cmd docker
+
+  # Check docker compose support
+  if docker compose version &>/dev/null; then
+    COMPOSE_CMD="docker compose"
+  elif docker-compose version &>/dev/null 2>&1; then
+    COMPOSE_CMD="docker-compose"
+  else
+    log_error "Docker Compose not found. Please install Docker Compose v2 or later."
+  fi
+
+  log_step "Starting TapData Lite deployment"
+
+  if [ ! -f "$WORK_DIR/docker-compose.yaml" ]; then
+    log_error "docker-compose.yaml not found in $WORK_DIR. Run 'tap-deploy init' first."
+  fi
+
+  $COMPOSE_CMD -f "$WORK_DIR/docker-compose.yaml" up -d
+
+  echo ""
+  log_info "TapData Lite deployed successfully!"
+  echo ""
+  echo "  TapData Console: http://localhost:${TAPDATA_HOST_PORT:-13030}"
+  echo "  MongoDB:         localhost:${MONGO_HOST_PORT:-27006}"
+  echo ""
+  echo "  Check status: bash tap-deploy status"
+  echo "  View logs:    $COMPOSE_CMD -f docker-compose.yaml logs -f"
+}
+
+# Push required images to cloud image registry
+# Images: tapdata (main service) and kubectl (init container)
+_push_images_to_cloud_registry() {
+  local push_url="$1"
+  local login_command="$2"
+  local provider="$3"
+  local region="$4"
+
+  check_cmd docker
+
+  # Define image sources (primary and fallback) with version tag
+  local image_tag="${TAP_DEPLOY_IMAGE_TAG:-latest}"
+  local tapdata_primary="tapdata8/tapdata:${image_tag}"
+  local tapdata_fallback="nexus.tapdata.net/tapdata-docker/tapdata-enterprise:${image_tag}"
+  local kubectl_primary="bitnami/kubectl:latest"
+  local kubectl_fallback="nexus.tapdata.net/tapdata-docker/kubectl:latest"
+
+  # Target image names in cloud registry
+  local tapdata_target="${push_url}/tapdata:${image_tag}"
+  local kubectl_target="${push_url}/kubectl:latest"
+
+  # Login to cloud registry
+  log_info "Logging in to cloud image registry..."
+  case "$provider" in
+    huaweicloud)
+      # Huawei SWR: use docker login with AK/SK temporary token
+      # The login_command from TF output is for reference only; we need to execute actual login
+      local swr_login_url="swr.${region}.myhuaweicloud.com"
+      log_info "Login URL: $swr_login_url"
+      eval "$login_command" || {
+        log_error "Failed to login to Huawei SWR. Command: $login_command"
+      }
+      ;;
+    aws)
+      # AWS ECR: use aws ecr get-login-password
+      eval "$login_command" || {
+        log_error "Failed to login to AWS ECR. Command: $login_command"
+      }
+      ;;
+    *)
+      log_error "Unsupported cloud provider for image push: $provider"
+      ;;
+  esac
+  log_info "Successfully logged in to cloud image registry"
+
+  # Pull, tag, and push tapdata image
+  log_info "Processing tapdata image..."
+  _pull_tag_push "$tapdata_primary" "$tapdata_fallback" "$tapdata_target"
+
+  # Pull, tag, and push kubectl image
+  log_info "Processing kubectl image..."
+  _pull_tag_push "$kubectl_primary" "$kubectl_fallback" "$kubectl_target"
+
+  log_info "All images pushed to cloud registry successfully"
+}
+
+# Pull image (with fallback), tag, and push to target registry
+_pull_tag_push() {
+  local primary="$1"
+  local fallback="$2"
+  local target="$3"
+
+  # Try pulling from primary source
+  log_info "Pulling $primary ..."
+  if docker pull "$primary" 2>/dev/null; then
+    docker tag "$primary" "$target"
+  else
+    log_warn "Failed to pull $primary, trying fallback: $fallback"
+    docker pull "$fallback" || {
+      log_error "Failed to pull image from both primary and fallback sources: $primary / $fallback"
+    }
+    docker tag "$fallback" "$target"
+  fi
+
+  # Push to cloud registry
+  log_info "Pushing $target ..."
+  docker push "$target" || {
+    log_error "Failed to push image: $target"
+  }
+  log_info "Pushed: $target"
+}
+
+_apply_cloud() {
+  local provider="${TAP_DEPLOY_CLOUD_PROVIDER:-huaweicloud}"
+
+  check_cmd terraform
+  check_cmd helm
+  check_cmd kubectl
+  check_cmd docker
+
+  # Phase 1: Terraform
+  log_step "Phase 1: Create infrastructure (Terraform)"
+  local tf_dir="$WORK_DIR/infrastructure/$provider"
+
+  if [ ! -d "$tf_dir" ]; then
+    # Try DEPLOY_HOME
+    tf_dir="$DEPLOY_HOME/infrastructure/$provider"
+    if [ ! -d "$tf_dir" ]; then
+      log_error "Terraform directory not found: infrastructure/$provider"
+    fi
+  fi
+
+  cd "$tf_dir"
+  terraform init
+  terraform apply -var-file=terraform.tfvars -auto-approve
+
+  # Phase 2: Configure kubeconfig
+  log_step "Phase 2: Configure Kubeconfig"
+  mkdir -p ~/.kube
+  terraform output -raw kubeconfig > ~/.kube/config-tapdata
+  export KUBECONFIG=~/.kube/config-tapdata
+
+  # Phase 3: Get registry info from Terraform outputs
+  log_step "Phase 3: Retrieve image registry information"
+  local registry_external_push_url
+  registry_external_push_url=$(terraform output -raw registry_external_push_url)
+  local registry_inner_pull_url
+  registry_inner_pull_url=$(terraform output -raw registry_inner_pull_url)
+  local registry_login_command
+  registry_login_command=$(terraform output -raw registry_login_command)
+  local registry_auth_info
+  registry_auth_info=$(terraform output -json registry_auth_info)
+
+  # Parse auth info (extract fields from JSON)
+  local registry_org registry_repo registry_region registry_provider
+  if command -v python3 &>/dev/null; then
+    registry_org=$(echo "$registry_auth_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['organization'])" 2>/dev/null || echo "")
+    registry_repo=$(echo "$registry_auth_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['repository'])" 2>/dev/null || echo "")
+    registry_region=$(echo "$registry_auth_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['region'])" 2>/dev/null || echo "")
+    registry_provider=$(echo "$registry_auth_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['provider'])" 2>/dev/null || echo "")
+  elif command -v jq &>/dev/null; then
+    registry_org=$(echo "$registry_auth_info" | jq -r '.organization' 2>/dev/null || echo "")
+    registry_repo=$(echo "$registry_auth_info" | jq -r '.repository' 2>/dev/null || echo "")
+    registry_region=$(echo "$registry_auth_info" | jq -r '.region' 2>/dev/null || echo "")
+    registry_provider=$(echo "$registry_auth_info" | jq -r '.provider' 2>/dev/null || echo "")
+  else
+    log_error "python3 or jq is required to parse Terraform output. Please install one of them."
+  fi
+
+  log_info "Registry inner pull URL:  $registry_inner_pull_url"
+  log_info "Registry external push URL: $registry_external_push_url"
+  log_info "Registry organization: $registry_org"
+  log_info "Registry repository: $registry_repo"
+
+  # Save registry info to config for later use
+  TAP_DEPLOY_CLOUD_REGISTRY_INNER_PULL_URL="$registry_inner_pull_url"
+  TAP_DEPLOY_CLOUD_REGISTRY_EXTERNAL_PUSH_URL="$registry_external_push_url"
+  TAP_DEPLOY_CLOUD_REGISTRY_ORG="$registry_org"
+  TAP_DEPLOY_CLOUD_REGISTRY_REPO="$registry_repo"
+  TAP_DEPLOY_CLOUD_REGISTRY_REGION="$registry_region"
+  TAP_DEPLOY_CLOUD_REGISTRY_PROVIDER="$registry_provider"
+
+  # Phase 4: Push images to cloud registry
+  log_step "Phase 4: Push images to cloud registry"
+  _push_images_to_cloud_registry "$registry_external_push_url" "$registry_login_command" "$provider" "$registry_region"
+
+  # Set image registry for Helm values rendering (use inner pull URL for K8s pods)
+  TAP_DEPLOY_IMAGE_REGISTRY="$registry_inner_pull_url"
+
+  # Phase 5: Install MongoDB Operator
+  log_step "Phase 5: Install MongoDB Community Operator"
+  helm repo add mongodb https://mongodb.github.io/helm-charts
+  helm repo update
+  helm install community-operator mongodb/community-operator \
+    --namespace mongodb \
+    --create-namespace \
+    --set operator.watchNamespace="*"
+
+  # Wait for operator to be ready
+  log_info "Waiting for MongoDB Operator to be ready..."
+  kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mongodb-community-operator -n mongodb --timeout=120s || true
+
+  # Phase 6: Re-render Helm values with cloud registry info and deploy
+  log_step "Phase 6: Deploy TapData (Helm)"
+  cd "$WORK_DIR"
+  _render_cloud_configs
+  _helm_install
+
+  echo ""
+  log_info "TapData Cloud deployment initiated!"
+  echo ""
+  echo "  Check deployment status: bash tap-deploy status"
+  echo "  Get access address:      kubectl -n ${TAP_DEPLOY_NAMESPACE:-tapdata} describe ingress tapdata-ingress | grep 'kubernetes.io/elb.ip'"
+}
+
+_apply_onprem() {
+  check_cmd helm
+  check_cmd kubectl
+
+  if [ "${TAP_DEPLOY_OFFLINE:-false}" = "true" ]; then
+    _apply_onprem_offline
+  else
+    _apply_onprem_online
+  fi
+}
+
+_apply_onprem_online() {
+  log_step "On-Prem online deployment"
+
+  # Step 1: Install MongoDB Operator
+  log_step "Step 1: Install MongoDB Community Operator"
+  helm repo add mongodb https://mongodb.github.io/helm-charts
+  helm repo update
+  helm install community-operator mongodb/community-operator \
+    --namespace mongodb \
+    --create-namespace \
+    --set operator.watchNamespace="*"
+
+  kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mongodb-community-operator -n mongodb --timeout=120s || true
+
+  # Step 2: Deploy TapData
+  log_step "Step 2: Deploy TapData (Helm)"
+  _helm_install
+
+  echo ""
+  log_info "TapData On-Prem deployment initiated!"
+  echo "  Check deployment status: bash tap-deploy status"
+}
+
+_apply_onprem_offline() {
+  log_step "On-Prem offline deployment"
+
+  check_cmd docker
+
+  local bundle_path="${TAP_DEPLOY_BUNDLE_PATH:-$WORK_DIR/images-bundle.tar.gz}"
+  local registry="${TAP_DEPLOY_HARBOR_REGISTRY:-}"
+
+  if [ -z "$registry" ]; then
+    log_error "Offline deployment requires an internal image registry (TAP_DEPLOY_HARBOR_REGISTRY)"
+  fi
+
+  # Step 1: Load images
+  log_step "Step 1: Load offline images"
+  if [ -f "$bundle_path" ]; then
+    docker load -i "$bundle_path"
+  else
+    log_error "Offline image bundle not found: $bundle_path"
+  fi
+
+  # Step 2: Tag and push images to internal registry
+  log_step "Step 2: Push images to internal registry ($registry)"
+  local images="tapdata8/tapdata:latest mongo:6.0 bitnami/kubectl:latest"
+  for img in $images; do
+    local target="$registry/$img"
+    docker tag "$img" "$target"
+    docker push "$target"
+    log_info "Pushed: $target"
+  done
+
+  # Step 3: Install MongoDB Operator
+  log_step "Step 3: Install MongoDB Community Operator"
+  # In offline mode, the operator image should already be loaded
+  # Use the offline chart if available
+  local operator_chart="$WORK_DIR/charts/mongodb-community-operator"
+  if [ -d "$operator_chart" ]; then
+    helm install community-operator "$operator_chart" \
+      --namespace mongodb \
+      --create-namespace \
+      --set operator.watchNamespace="*" \
+      --set image.repository="$registry/mongodb/community-operator"
+  else
+    log_warn "MongoDB Operator offline chart not found, attempting online install"
+    helm repo add mongodb https://mongodb.github.io/helm-charts
+    helm install community-operator mongodb/community-operator \
+      --namespace mongodb \
+      --create-namespace \
+      --set operator.watchNamespace="*"
+  fi
+
+  # Step 4: Deploy TapData
+  log_step "Step 4: Deploy TapData (Helm)"
+  _helm_install
+
+  echo ""
+  log_info "TapData On-Prem offline deployment initiated!"
+  echo "  Check deployment status: bash tap-deploy status"
+}
+
+_helm_install() {
+  local release="${TAP_DEPLOY_HELM_RELEASE:-tapdata}"
+  local namespace="${TAP_DEPLOY_NAMESPACE:-tapdata}"
+  local chart_dir
+
+  # Find the Helm chart directory
+  if [ -d "$WORK_DIR/deploy-on-kubernetes" ]; then
+    chart_dir="$WORK_DIR/deploy-on-kubernetes"
+  elif [ -d "$DEPLOY_HOME/deploy-on-kubernetes" ]; then
+    chart_dir="$DEPLOY_HOME/deploy-on-kubernetes"
+  else
+    log_error "Helm chart directory not found: deploy-on-kubernetes"
+  fi
+
+  local values_file="$WORK_DIR/values.yaml"
+  if [ ! -f "$values_file" ]; then
+    log_error "values.yaml not found in $WORK_DIR. Run 'tap-deploy init' first."
+  fi
+
+  helm install "$release" "$chart_dir" \
+    --namespace "$namespace" \
+    --create-namespace \
+    -f "$values_file"
+
+  log_info "Waiting for pods to be ready..."
+  kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance="$release" -n "$namespace" --timeout=600s || true
+}
+
+# ============================================================================
+# STATUS Command
+# ============================================================================
+
+cmd_status() {
+  load_config
+
+  log_step "Deployment status - Mode: $TAP_DEPLOY_MODE"
+  echo ""
+
+  case "$TAP_DEPLOY_MODE" in
+    lite)
+      _status_lite
+      ;;
+    cloud)
+      _status_cloud
+      ;;
+    on-prem)
+      _status_onprem
+      ;;
+  esac
+}
+
+_status_lite() {
+  local compose_cmd
+  if docker compose version &>/dev/null; then
+    compose_cmd="docker compose"
+  elif docker-compose version &>/dev/null 2>&1; then
+    compose_cmd="docker-compose"
+  else
+    log_error "Docker Compose not found"
+  fi
+
+  if [ -f "$WORK_DIR/docker-compose.yaml" ]; then
+    $compose_cmd -f "$WORK_DIR/docker-compose.yaml" ps
+  else
+    log_error "docker-compose.yaml not found in $WORK_DIR"
+  fi
+}
+
+_status_cloud() {
+  local release="${TAP_DEPLOY_HELM_RELEASE:-tapdata}"
+  local namespace="${TAP_DEPLOY_NAMESPACE:-tapdata}"
+
+  echo "--- Terraform State ---"
+  local tf_dir="$WORK_DIR/infrastructure/${TAP_DEPLOY_CLOUD_PROVIDER:-huaweicloud}"
+  if [ -d "$tf_dir" ]; then
+    (cd "$tf_dir" && terraform show) || true
+  else
+    echo "  Terraform directory not found"
+  fi
+
+  echo ""
+  echo "--- Helm Status ---"
+  if has_cmd helm; then
+    helm status "$release" -n "$namespace" 2>/dev/null || echo "  Helm release '$release' not found"
+  else
+    echo "  helm command not found"
+  fi
+
+  echo ""
+  echo "--- Pod Status ---"
+  if has_cmd kubectl; then
+    kubectl get pods -n "$namespace" 2>/dev/null || echo "  Unable to get pod status"
+  else
+    echo "  kubectl command not found"
+  fi
+}
+
+_status_onprem() {
+  local release="${TAP_DEPLOY_HELM_RELEASE:-tapdata}"
+  local namespace="${TAP_DEPLOY_NAMESPACE:-tapdata}"
+
+  echo "--- Helm Status ---"
+  if has_cmd helm; then
+    helm status "$release" -n "$namespace" 2>/dev/null || echo "  Helm release '$release' not found"
+  else
+    echo "  helm command not found"
+  fi
+
+  echo ""
+  echo "--- Pod Status ---"
+  if has_cmd kubectl; then
+    kubectl get pods -n "$namespace" 2>/dev/null || echo "  Unable to get pod status"
+  else
+    echo "  kubectl command not found"
+  fi
+}
+
+# ============================================================================
+# DESTROY Command
+# ============================================================================
+
+cmd_destroy() {
+  load_config
+
+  log_step "Destroy deployment - Mode: $TAP_DEPLOY_MODE"
+  echo ""
+
+  if ! prompt_confirm "Are you sure you want to destroy the TapData deployment? This action is irreversible" "n"; then
+    log_info "Operation cancelled"
+    return
+  fi
+
+  case "$TAP_DEPLOY_MODE" in
+    lite)    _destroy_lite ;;
+    cloud)   _destroy_cloud ;;
+    on-prem) _destroy_onprem ;;
+  esac
+}
+
+_destroy_lite() {
+  local compose_cmd
+  if docker compose version &>/dev/null; then
+    compose_cmd="docker compose"
+  elif docker-compose version &>/dev/null 2>&1; then
+    compose_cmd="docker-compose"
+  else
+    log_error "Docker Compose not found"
+  fi
+
+  $compose_cmd -f "$WORK_DIR/docker-compose.yaml" down -v
+  log_info "TapData Lite deployment destroyed"
+}
+
+_destroy_cloud() {
+  local release="${TAP_DEPLOY_HELM_RELEASE:-tapdata}"
+  local namespace="${TAP_DEPLOY_NAMESPACE:-tapdata}"
+
+  # Uninstall Helm first
+  log_step "Step 1: Uninstall TapData (Helm)"
+  if has_cmd helm; then
+    helm uninstall "$release" -n "$namespace" 2>/dev/null || true
+  fi
+
+  # Destroy Terraform infrastructure
+  log_step "Step 2: Destroy infrastructure (Terraform)"
+  local tf_dir="$WORK_DIR/infrastructure/${TAP_DEPLOY_CLOUD_PROVIDER:-huaweicloud}"
+  if [ -d "$tf_dir" ]; then
+    cd "$tf_dir"
+    terraform destroy -var-file=terraform.tfvars -auto-approve
+  else
+    log_warn "Terraform directory not found, skipping infrastructure destroy"
+  fi
+
+  log_info "TapData Cloud deployment destroyed"
+}
+
+_destroy_onprem() {
+  local release="${TAP_DEPLOY_HELM_RELEASE:-tapdata}"
+  local namespace="${TAP_DEPLOY_NAMESPACE:-tapdata}"
+
+  if has_cmd helm; then
+    helm uninstall "$release" -n "$namespace"
+  else
+    log_error "helm command not found"
+  fi
+
+  log_info "TapData On-Prem deployment destroyed"
+}
+
+# ============================================================================
+# BUNDLE Command
+# ============================================================================
+
+cmd_bundle() {
+  local output="${1:-$WORK_DIR/images-bundle.tar.gz}"
+  local arch_list=""
+
+  check_cmd docker
+
+  log_step "Create offline installation bundle"
+  echo ""
+
+  # Determine architecture
+  prompt_select "Select target architecture" "AMD64" "ARM64" "Both (AMD64 + ARM64)"
+  case "$SELECTED_OPTION" in
+    AMD64)      arch_list="linux/amd64" ;;
+    ARM64)      arch_list="linux/arm64" ;;
+    Both*)      arch_list="linux/amd64,linux/arm64" ;;
+  esac
+
+  local tmp_dir
+  tmp_dir=$(mktemp -d)
+  local bundle_dir="$tmp_dir/tapdata-bundle"
+  mkdir -p "$bundle_dir/images" "$bundle_dir/chart" "$bundle_dir/config"
+
+  # List of images to bundle
+  local images=(
+    "tapdata8/tapdata:latest"
+    "mongo:6.0"
+    "mongodb/community-operator:latest"
+    "bitnami/kubectl:latest"
+  )
+
+  # Pull and save images
+  log_step "Pull container images"
+  for arch in ${arch_list//,/ }; do
+    for img in "${images[@]}"; do
+      log_info "Pulling: $img ($arch)"
+      if [ "$arch" = "linux/amd64" ]; then
+        docker pull --platform linux/amd64 "$img" || docker pull "$img"
+      else
+        docker pull --platform "$arch" "$img" || log_warn "Failed to pull $img for $arch, skipping"
+      fi
+    done
+  done
+
+  # Save images to tar
+  log_step "Package container images"
+  docker save -o "$bundle_dir/images/images.tar" "${images[@]}" 2>/dev/null || {
+    # Fallback: save one by one
+    for img in "${images[@]}"; do
+      local img_name
+      img_name=$(echo "$img" | tr '/:' '_')
+      docker save -o "$bundle_dir/images/${img_name}.tar" "$img"
+    done
+  }
+
+  # Copy Helm chart
+  log_step "Package Helm Chart"
+  local chart_src
+  if [ -d "$DEPLOY_HOME/deploy-on-kubernetes" ]; then
+    chart_src="$DEPLOY_HOME/deploy-on-kubernetes"
+  elif [ -d "$WORK_DIR/deploy-on-kubernetes" ]; then
+    chart_src="$WORK_DIR/deploy-on-kubernetes"
+  else
+    log_error "Helm chart directory not found"
+  fi
+  cp -r "$chart_src/"* "$bundle_dir/chart/"
+  # Remove template files from the bundle
+  rm -f "$bundle_dir/chart/values.yaml.tmpl"
+
+  # Copy tap-deploy script itself
+  log_step "Package tap-deploy script"
+  cp "$DEPLOY_HOME/tap-deploy" "$bundle_dir/"
+
+  # Copy application templates
+  local tmpl_src
+  if [ -d "$DEPLOY_HOME/templates" ]; then
+    tmpl_src="$DEPLOY_HOME/templates"
+  elif [ -d "$WORK_DIR/templates" ]; then
+    tmpl_src="$WORK_DIR/templates"
+  else
+    tmpl_src=""
+  fi
+  if [ -n "$tmpl_src" ]; then
+    cp -r "$tmpl_src/"* "$bundle_dir/config/"
+  fi
+
+  # Generate offline deployment instructions
+  cat > "$bundle_dir/README-OFFLINE.txt" <<'EOF'
+=== TapData Offline Installation Bundle ===
+
+Directory structure:
+  tapdata-bundle/
+  ├── tap-deploy          # Deployment script
+  ├── images/             # Container images
+  │   └── images.tar      # Image bundle
+  ├── chart/              # Helm Chart
+  └── config/             # Application configuration templates
+
+Offline deployment steps:
+
+1. Transfer the bundle to the target server
+   scp images-bundle.tar.gz user@target-host:/opt/
+
+2. Extract the bundle
+   tar -xzf images-bundle.tar.gz
+
+3. Load container images
+   docker load -i tapdata-bundle/images/images.tar
+
+4. Push images to internal registry (e.g. Harbor)
+   docker tag tapdata8/tapdata:latest <harbor-registry>/tapdata/tapdata:latest
+   docker push <harbor-registry>/tapdata/tapdata:latest
+   # Repeat for other images
+
+5. Initialize configuration
+   bash tapdata-bundle/tap-deploy init
+
+6. Execute deployment
+   bash tapdata-bundle/tap-deploy apply
+
+Notes:
+- All images must be pushed to the internal registry before K8s can pull them
+- Select On-Prem mode during init, and configure the internal image registry URL
+EOF
+
+  # Pack everything
+  log_step "Compress bundle"
+  cd "$tmp_dir"
+  tar -czf "$output" tapdata-bundle/
+  rm -rf "$tmp_dir"
+
+  echo ""
+  log_info "Offline installation bundle created: $output"
+  echo ""
+  echo "  Contents:"
+  echo "    - Container images: ${images[*]}"
+  echo "    - Helm Chart"
+  echo "    - tap-deploy script"
+  echo "    - Offline deployment instructions"
+  echo ""
+  echo "  Transfer to offline environment:"
+  echo "    scp $output user@target-host:/opt/"
+}
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+usage() {
+  cat <<EOF
+TapData One-Deploy v${TAP_DEPLOY_VERSION}
+
+Usage:
+  bash tap-deploy <command> [options]
+
+Commands:
+  init      Initialize configuration (interactive wizard)
+  plan      Preview deployment content
+  apply     Execute deployment
+  status    View deployment status
+  destroy   Destroy deployment
+  bundle    Create offline installation bundle (On-Prem scenario)
+
+Options:
+  -d, --dir <path>   Specify working directory (default: current directory)
+  -h, --help         Show help information
+  -v, --version      Show version information
+
+Examples:
+  bash tap-deploy init                                    # Initialize in current directory
+  bash tap-deploy -d /opt/tapdata init                    # Initialize in specified directory
+  bash tap-deploy plan                                    # Preview deployment
+  bash tap-deploy apply                                   # Execute deployment
+  bash tap-deploy status                                  # View status
+  bash tap-deploy destroy                                 # Destroy deployment
+  bash tap-deploy bundle --output bundle.tar.gz           # Create offline bundle
+
+Environment Variables:
+  TAP_DEPLOY_CONFIG_URL  Configuration template URL (default: https://resource.tapdata.net/deploy-config/tapdata-deploy-latest.tar.gz)
+
+Current Worker Directory:
+  ${WORK_DIR}
+
+EOF
+}
+
+main() {
+  # Parse global options first
+  local opt_dir=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -d|--dir)
+        opt_dir="$2"
+        shift 2
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  # Override WORK_DIR if -d is specified
+  if [ -n "$opt_dir" ]; then
+    # Convert to absolute path
+    if [[ "$opt_dir" != /* ]]; then
+      opt_dir="$(pwd)/$opt_dir"
+    fi
+    mkdir -p "$opt_dir"
+    WORK_DIR="$(cd "$opt_dir" && pwd)"
+    CONFIG_FILE="${WORK_DIR}/.tap-deploy.env"
+  fi
+
+  local command="${1:-}"
+  shift || true
+
+  case "$command" in
+    init)
+      cmd_init
+      ;;
+    plan)
+      cmd_plan
+      ;;
+    apply)
+      cmd_apply
+      ;;
+    status)
+      cmd_status
+      ;;
+    destroy)
+      cmd_destroy
+      ;;
+    bundle)
+      local bundle_output=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --output|-o)
+            bundle_output="$2"
+            shift 2
+            ;;
+          *)
+            shift
+            ;;
+        esac
+      done
+      cmd_bundle "$bundle_output"
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    -v|--version)
+      echo "TapData One-Deploy v${TAP_DEPLOY_VERSION}"
+      echo "Platform: ${PLATFORM}/${ARCH}"
+      echo "Working directory: ${WORK_DIR}"
+      ;;
+    "")
+      usage
+      exit 1
+      ;;
+    *)
+      log_error "Unknown command: $command\nRun 'bash tap-deploy --help' for usage."
+      ;;
+  esac
+}
+
+main "$@"

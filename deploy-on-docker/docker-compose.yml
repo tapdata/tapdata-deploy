@@ -1,0 +1,71 @@
+services:
+  mongodb:
+    hostname: mdb0
+    image: mongo:6.0
+    container_name: tapdata-mdb
+    restart: always
+    environment:
+      #MONGO_INITDB_ROOT_USERNAME: root
+      #MONGO_INITDB_ROOT_PASSWORD: example
+      #MONGO_INITDB_DATABASE: /initdb.d
+      profile: prod
+    volumes:
+      - "./mongodb/startup.sh:/startup.sh"
+      - "./mongodb/config:/etc/mongo"
+      - "./mongodb/data:/data"
+      - "./mongodb/logs:/var/log/mongo"
+      - "./mongodb/initdb.d:/docker-entrypoint-initdb.d"
+    ports:
+        - "27006:27017"
+    command:
+      - bash
+      - /startup.sh
+
+    healthcheck:
+      test: mongosh "mongodb://localhost:27017/admin" --eval "db.hello()"
+      interval: 10s
+      retries: 10
+      timeout: 10s
+
+    networks:
+      tapdata:
+  tapdata:
+    image: tapdata8/tapdata
+    container_name: tapdata-lite
+    restart: always
+    depends_on:
+      - mongodb
+    networks:
+      tapdata:
+    ports:
+      - "13030:3030"
+    environment:
+      - MONGODB_CONNECTION_STRING=mdb0:27017/tapdata?authSource=admin
+      #- MONGODB_PASSWORD=example
+      #- MONGODB_USER=root
+      - FRONTEND_WORKER_COUNT=1
+      - API_WORKER_COUNT=1
+      - TZ=Asia/Shanghai
+      - JAVA_VERSION=java17
+      - LICENSE_HOST=113.98.206.142:18080
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "ps -ef | grep tapdata-agent.jar | grep -v \"grep tapdata-agent.jar\""]
+      interval: 2m
+      timeout: 20s
+      retries: 16
+      start_period: 2m
+    volumes:
+      - ./tapdata/logs:/tapdata/apps/logs
+      - ./tapdata/docker-entrypoint.sh:/tapdata/docker-entrypoint.sh
+      - ./tapdata/agent.yml:/tapdata/apps/agent.yml
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 12G
+        reservations:
+          cpus: '4'
+          memory: 12G
+
+networks:
+  tapdata:

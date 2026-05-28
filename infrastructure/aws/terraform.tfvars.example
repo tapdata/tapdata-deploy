@@ -1,0 +1,12 @@
+region             = "us-east-1"
+access_key         = "your-access-key"
+secret_key         = "your-secret-key"
+availability_zones = ["us-east-1a", "us-east-1b"]
+cluster_name       = "tapdata-aws"
+node_count         = 2
+node_instance_type = "t3.medium"
+key_pair_name      = ""
+
+# 镜像仓库配置
+registry_organization   = ""  # 留空则使用 cluster_name（AWS 使用账号 ID）
+registry_repository_name = ""  # 留空则使用 cluster_name

@@ -1,0 +1,35 @@
+spring:
+    data:
+        mongodb:
+            uri: ""
+            ssl: 'false'
+            sslCA: ""
+            sslCertKey: ""
+            conn_params: ""
+            username: "{{MONGODB_USER}}"
+            password: "{{MONGODB_PASSWORD}}"
+            mongoConnectionString: '{{MONGODB_CONNECTION_STRING}}'
+            sslPEMKeyFilePassword: U2FsdGVkX1+mndt/qnglPQ==
+            authenticationDatabase: admin
+tapdata:
+    metrics:
+        enable: true
+        enginePort: 3035
+        agentPort: 3036
+    cloud:
+        accessCode: '<ACCESS_CODE>'
+        retryTime: 3
+        baseURLs: '{{TAPDATA_BASE_URLS}}'
+    mode: {{TAPDATA_MODE}}
+    conf:
+        tapdataPort: '3030'
+        backendUrl: '{{TAPDATA_BACKEND_URL}}'
+        apiServerPort: '3080'
+        tapdataJavaOpts: '-Xmx8G -Xms4G'
+        SCRIPT_DIR: etc
+        reportInterval: 5000
+        apiWorkerMaxMemory: 512
+        uuid: {{TAPDATA_UUID}}
+        Decimal128ToNumber: 'false'
+        tapdataTMJavaOpts: '-Xmx8G -Xms4G'
+        responseOfTotalType: NUMBER

@@ -1,0 +1,12 @@
+region             = "cn-north-4"
+access_key         = "your-access-key"
+secret_key         = "your-secret-key"
+availability_zones = ["cn-north-4a", "cn-north-4b"]
+cluster_name       = "tapdata-hw"
+node_count         = 2
+node_flavor        = "s6.large.2"
+key_pair_name      = ""
+
+# 镜像仓库配置
+registry_organization   = ""  # 留空则使用 cluster_name
+registry_repository_name = ""  # 留空则使用 cluster_name

@@ -1,0 +1,129 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  validate-terraform:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        path:
+          - infrastructure/aws
+          - infrastructure/huaweicloud
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.7"
+
+      - name: Terraform Init
+        working-directory: ${{ matrix.path }}
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        working-directory: ${{ matrix.path }}
+        run: terraform validate
+
+  validate-helm:
+    name: Validate Helm Charts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "v3.14.0"
+
+      - name: Helm Lint Main Chart
+        working-directory: deploy-on-kubernetes
+        run: helm lint .
+
+      - name: Helm Template Main Chart
+        working-directory: deploy-on-kubernetes
+        run: helm template . > /dev/null
+
+      - name: Helm Lint Sub Charts
+        run: |
+          for chart in deploy-on-kubernetes/charts/*/; do
+            if [ -f "${chart}Chart.yaml" ]; then
+              echo "Linting: ${chart}"
+              helm lint "${chart}"
+            fi
+          done
+
+  validate-docker-compose:
+    name: Validate Docker Compose
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate Docker Compose
+        working-directory: deploy-on-docker
+        run: docker compose config --quiet
+
+  package-and-upload:
+    name: Package & Upload to OSS
+    runs-on: ubuntu-latest
+    needs: [validate-terraform, validate-helm, validate-docker-compose]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create archive
+        run: |
+          tar czf ../tapdata-deploy-latest.tar.gz \
+            --exclude='.git' \
+            --exclude='.idea' \
+            --exclude='deploy-on-docker/mongodb/data' \
+            --exclude='deploy-on-docker/mongodb/logs' \
+            --exclude='deploy-on-docker/tapdata/logs' \
+            --exclude='infrastructure/aws/.terraform' \
+            --exclude='infrastructure/huaweicloud/.terraform' \
+            --exclude='infrastructure/aws/terraform.tfstate' \
+            --exclude='infrastructure/aws/terraform.tfstate.backup' \
+            --exclude='infrastructure/huaweicloud/terraform.tfstate' \
+            --exclude='infrastructure/huaweicloud/terraform.tfstate.backup' \
+            -C .. \
+            tapdata-deploy
+
+      - name: Generate checksum
+        run: |
+          shasum -a 256 ../tapdata-deploy-latest.tar.gz > ../tapdata-deploy-latest-checksum.txt
+          cat ../tapdata-deploy-latest-checksum.txt
+
+      - name: Install ossutil
+        run: |
+          curl -sL -o /usr/local/bin/ossutil64 \
+            https://gosspublic.alicdn.com/ossutil/1.7.18/ossutil64
+          chmod +x /usr/local/bin/ossutil64
+          ossutil64 -v
+
+      - name: Upload to OSS
+        env:
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          OSS_BUCKET_NAME: ${{ secrets.OSS_BUCKET_NAME }}
+          OSS_ENDPOINT: ${{ secrets.OSS_ENDPOINT }}
+        run: |
+          ossutil64 config -e "${OSS_ENDPOINT}" -i "${OSS_ACCESS_KEY_ID}" -k "${OSS_ACCESS_KEY_SECRET}"
+          ossutil64 cp ../tapdata-deploy-latest.tar.gz \
+            oss://${OSS_BUCKET_NAME}/deploy-config/tapdata-deploy-latest.tar.gz \
+            --force
+          ossutil64 cp ../tapdata-deploy-latest-checksum.txt \
+            oss://${OSS_BUCKET_NAME}/deploy-config/tapdata-deploy-latest-checksum.txt \
+            --force
+          echo "Upload complete:"
+          echo "  oss://${OSS_BUCKET_NAME}/deploy-config/tapdata-deploy-latest.tar.gz"
+          echo "  oss://${OSS_BUCKET_NAME}/deploy-config/tapdata-deploy-latest-checksum.txt"
