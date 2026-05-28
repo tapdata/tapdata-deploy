@@ -2,11 +2,15 @@ global:
   imageRegistry: "{{IMAGE_REGISTRY}}"
   imagePullSecret:
     enabled: {{IMAGE_PULL_SECRET_ENABLED}}
-    name: registry-auth
+    name: "{{IMAGE_PULL_SECRET_NAME}}"
     registry: "{{IMAGE_PULL_SECRET_REGISTRY}}"
     username: "{{IMAGE_PULL_SECRET_USERNAME}}"
     password: "{{IMAGE_PULL_SECRET_PASSWORD}}"
-  imagePullSecrets: []
+  # imagePullSecrets references the Secret name(s) to use for pulling images.
+  # When imagePullSecret.enabled is true, this should reference the created Secret.
+  # When using external Secrets (e.g., cloud provider default), set this directly.
+  # Format: JSON array like ["secret1", "secret2"]
+  imagePullSecrets: {{IMAGE_PULL_SECRETS_ARRAY}}
   mongodb:
     replicaSetName: tapdata-mongodb
     protocol: mongodb
