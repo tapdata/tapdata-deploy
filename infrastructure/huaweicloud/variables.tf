@@ -1,19 +1,25 @@
-variable "region" {
-  description = "华为云区域"
-  type        = string
-  default     = "cn-north-4"
-}
-
 variable "access_key" {
-  description = "华为云 Access Key"
+  description = "Access Key"
   type        = string
   sensitive   = true
 }
 
 variable "secret_key" {
-  description = "华为云 Secret Key"
+  description = "Secret Key"
   type        = string
   sensitive   = true
+}
+
+variable "region" {
+  description = "Region"
+  type        = string
+  default     = "ap-southeast-1"
+}
+
+variable "availability_zones" {
+  description = "Zones"
+  type        = list(string)
+  default     = ["ap-southeast-1a", "ap-southeast-1b"]
 }
 
 variable "vpc_cidr" {
@@ -22,38 +28,32 @@ variable "vpc_cidr" {
   default     = "172.16.0.0/16"
 }
 
-variable "availability_zones" {
-  description = "可用区列表"
-  type        = list(string)
-  default     = []
-}
-
 variable "cluster_name" {
-  description = "K8S 集群名称"
+  description = "kubernetes Cluster Name"
   type        = string
   default     = "tapdata-k8s"
 }
 
 variable "node_count" {
-  description = "工作节点数量"
+  description = "Worker node count"
   type        = number
-  default     = 2
+  default     = 3
 }
 
 variable "node_flavor" {
-  description = "节点规格（flavor_id）"
+  description = "Node Specifications（flavor_id）"
   type        = string
-  default     = ""
+  default     = "s2.4xlarge.2"
 }
 
 variable "key_pair_name" {
-  description = "密钥对名称（留空则自动创建）"
+  description = "Key pair (It's empty will be created automatically.)"
   type        = string
   default     = ""
 }
 
 variable "tags" {
-  description = "资源标签"
+  description = "Resource tags"
   type        = map(string)
   default = {
     Project   = "TapData"
@@ -62,13 +62,13 @@ variable "tags" {
 }
 
 variable "registry_organization" {
-  description = "镜像仓库组织名称（留空则使用 cluster_name）"
+  description = "Registry organization name (use cluster_name if left blank)"
   type        = string
   default     = ""
 }
 
 variable "registry_repository_name" {
-  description = "镜像仓库名称（留空则使用 cluster_name）"
+  description = "Registry name（use cluster_name if left blank）"
   type        = string
   default     = ""
 }

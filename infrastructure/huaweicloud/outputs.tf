@@ -35,33 +35,33 @@ output "subnet_cidr_id" {
 }
 
 output "registry_organization" {
-  description = "镜像仓库组织名称"
+  description = "Registry organization name"
   value       = huaweicloud_swr_organization.main.name
 }
 
 output "registry_repository_name" {
-  description = "镜像仓库名称"
+  description = "Registry repository name"
   value       = huaweicloud_swr_repository.main.name
 }
 
 output "registry_inner_pull_url" {
-  description = "镜像仓库内网 pull 镜像地址（CCE 节点使用）"
+  description = "Internal network pull image address of the registry"
   value       = "swr.${var.region}.myhuaweicloud.com/${huaweicloud_swr_organization.main.name}/${huaweicloud_swr_repository.main.name}"
 }
 
 output "registry_external_push_url" {
-  description = "镜像仓库外网 push 镜像地址"
+  description = "External network push mirror address"
   value       = "swr-api.${var.region}.myhuaweicloud.com/${huaweicloud_swr_organization.main.name}/${huaweicloud_swr_repository.main.name}"
 }
 
 output "registry_login_command" {
-  description = "镜像仓库登录命令"
-  value       = "docker login -u ${var.access_key} -p <temporary_token> swr.${var.region}.myhuaweicloud.com"
+  description = "Registry docker login command"
+  value       = huaweicloud_swr_temporary_login_command.main.x_swr_docker_login
   sensitive   = true
 }
 
 output "registry_auth_info" {
-  description = "镜像仓库认证信息"
+  description = "Registry auth info"
   value = {
     organization      = huaweicloud_swr_organization.main.name
     repository        = huaweicloud_swr_repository.main.name
@@ -69,6 +69,9 @@ output "registry_auth_info" {
     external_push_url = "swr-api.${var.region}.myhuaweicloud.com/${huaweicloud_swr_organization.main.name}/${huaweicloud_swr_repository.main.name}"
     region            = var.region
     provider          = "huaweicloud"
+    auth              = huaweicloud_swr_temporary_login_command.main.x_swr_docker_login
+    auth_expire_at    = huaweicloud_swr_temporary_login_command.main.x_expire_at
+    auth_description  = "⚠️ This authentication is temporary (expire at ${huaweicloud_swr_temporary_login_command.main.x_expire_at}). After deployment, please be sure to update it with long-term valid authentication information to avoid being unable to pull the image due to authentication expiration."
   }
   sensitive = true
 }

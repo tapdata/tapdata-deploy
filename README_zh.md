@@ -33,7 +33,7 @@ TapData One-Deploy 是 TapData 官方提供的全场景自动化部署工具，�
 
 ```bash
 # 下载 tap-deploy 脚本
-curl -L https://github.com/tapdata/tapdata-deploy/releases/latest/download/tap-deploy -o tap-deploy
+curl -L https://resource.tapdata.net/deploy/tap-deploy -o tap-deploy
 chmod +x tap-deploy
 
 # 查看帮助
