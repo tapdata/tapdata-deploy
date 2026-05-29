@@ -1572,13 +1572,27 @@ _status_cloud() {
     echo "  helm command not found"
   fi
 
-  echo ""
-  echo "--- Pod Status ---"
   if has_cmd kubectl; then
+    echo ""
+    echo "--- Pod Status ---"
     kubectl get pods -n "$namespace" 2>/dev/null || echo "  Unable to get pod status"
+
+    echo ""
+    echo "--- MongoDB Status ---"
+    kubectl get mdbc -n "$namespace" 2>/dev/null || echo "  Unable to get MongoDB status"
+
+    echo ""
+    echo "--- Ingress Status ---"
+    kubectl get ingress -n "$namespace" 2>/dev/null || echo "  Unable to get ingress status"
+
+    echo ""
+    echo "--- Ingress Public Ip Status ---"
+    kubectl describe ingress -n tapdata -l app.kubernetes.io/name=tapdata | grep 'kubernetes.io/elb.ip' | awk '{print $2}'  2>/dev/null || echo "  Unable to get ingress status"
   else
     echo "  kubectl command not found"
   fi
+
+  echo ""
 }
 
 _status_onprem() {
