@@ -9,7 +9,7 @@ global:
   # imagePullSecrets references the Secret name(s) to use for pulling images.
   # When imagePullSecret.enabled is true, this should reference the created Secret.
   # When using external Secrets (e.g., cloud provider default), set this directly.
-  # Format: JSON array like ["secret1", "secret2"]
+  # Format: JSON array like [{"name": "secret1"}, {"name": "secret2"}]
   imagePullSecrets: {{IMAGE_PULL_SECRETS_ARRAY}}
   mongodb:
     replicaSetName: tapdata-mongodb
@@ -20,14 +20,10 @@ global:
     database: tapdata
     hosts: "{{MONGODB_HOSTS}}"
 
-ingress:
-  enabled: {{INGRESS_ENABLED}}
-  name: ""
-  className: "{{INGRESS_CLASS_NAME}}"
-  pathType: ImplementationSpecific
-  annotations: {}
-  host: ""
-  tls: []
+# Ingress configuration is provided by cloud-specific values files:
+# - values-ingress-huaweicloud.yaml (Huawei Cloud CCE)
+# - values-ingress-aws.yaml (AWS EKS)
+# These files are automatically merged during helm install based on cloud provider.
 
 mongodb:
   nameOverride: "mongodb"

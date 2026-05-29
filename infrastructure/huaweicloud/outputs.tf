@@ -51,7 +51,7 @@ output "registry_inner_pull_url" {
 
 output "registry_external_push_url" {
   description = "External network push mirror address"
-  value       = "swr-api.${var.region}.myhuaweicloud.com/${huaweicloud_swr_organization.main.name}"
+  value       = "swr.${var.region}.myhuaweicloud.com/${huaweicloud_swr_organization.main.name}"
 }
 
 output "registry_login_command" {
@@ -66,7 +66,7 @@ output "registry_auth_info" {
     organization      = huaweicloud_swr_organization.main.name
     repository        = huaweicloud_swr_repository.main.name
     inner_pull_url    = "swr.${var.region}.myhuaweicloud.com/${huaweicloud_swr_organization.main.name}/${huaweicloud_swr_repository.main.name}"
-    external_push_url = "swr-api.${var.region}.myhuaweicloud.com/${huaweicloud_swr_organization.main.name}/${huaweicloud_swr_repository.main.name}"
+    external_push_url = "swr.${var.region}.myhuaweicloud.com/${huaweicloud_swr_organization.main.name}/${huaweicloud_swr_repository.main.name}"
     region            = var.region
     provider          = "huaweicloud"
     auth_docker_login = "${huaweicloud_swr_temporary_login_command.main.x_swr_docker_login} swr.${var.region}.myhuaweicloud.com"

@@ -13,5 +13,5 @@
 **/*.tgz
 **/*.tar.gz
 .tap-deploy.env
-deploy-on-kubernetes/values-*.yaml
+deploy-on-kubernetes/values-*-tmp.yaml
 design.md
