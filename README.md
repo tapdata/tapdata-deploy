@@ -2,138 +2,285 @@
 
 [English](README.md) | [中文](README_zh.md)
 
-## Overview
+TapData One-Deploy is the official all-scenario automated deployment tool for TapData, covering the full delivery pipeline from single-node development to enterprise-grade cloud-native production.
 
-TapData One-Deploy is the official automated deployment tool for TapData, providing unified delivery from single-node testing to enterprise-grade cloud-native environments.
+> *Build Once, Run Anywhere*
 
-**Core Vision**: *"Build Once, Run Anywhere"*
-
-### Deployment Modes
-
-| Mode | Scenario | Tech Stack |
-|------|----------|------------|
-| **Lite** | Local development, quick POC | Docker Compose |
-| **Cloud** | Huawei Cloud/AWS production | Terraform + Kubernetes |
-| **On-Prem** | Customer data center, offline | Offline Image Bundle + Harbor |
-
----
-
-## Key Features
-
-- **Zero Installation**: Download and run directly, supports Linux/macOS
-- **Interactive Configuration**: Command-line wizard auto-generates configuration
-- **Full Scenario Coverage**: Lite / Cloud / On-Prem modes
-- **Multi-Architecture**: AMD64 and ARM64 (Huawei Kunpeng/Phytium)
+| Mode | Scenario | Tech Stack | Status |
+|------|----------|------------|--------|
+| **Lite** | Dev / POC | Docker Compose | ✅ |
+| **Cloud** | Huawei Cloud CCE | Terraform + Helm | ✅ |
+| **Cloud** | AWS EKS | Terraform + Helm | ⌛️ |
+| **On-Prem** | Customer DC / Air-gapped | Offline Image Bundle + Helm | ⌛️ |
 
 ---
 
 ## Quick Start
 
-### Download & Run
-
 ```bash
-# Download tap-deploy script
-curl -L https://resource.tapdata.net/deploy/tap-deploy -o tap-deploy
-chmod +x tap-deploy
+# Download
+curl -L https://resource.tapdata.net/deploy/tap-deploy -o tap-deploy && chmod +x tap-deploy
 
-# View help
-./tap-deploy --help
+# Init → Plan → Apply
+./tap-deploy init      # Interactive configuration wizard
+./tap-deploy plan      # Preview deployment
+./tap-deploy apply     # Execute deployment
 ```
 
-### Lite Mode: 5-Minute Quick Experience
+After deploying in Lite mode, open `http://localhost:13030` in your browser to access the console (default account `admin@admin.com`, password `admin`).
 
-Suitable for local development and testing, no cloud environment required:
-
-```bash
-# 1. Initialize configuration (select Lite mode, set admin password)
-./tap-deploy init
-
-# 2. Preview deployment
-./tap-deploy plan
-
-# 3. Execute deployment
-./tap-deploy apply
-
-# 4. Access TapData Console
-# Open browser: http://localhost:3030
-# Username: admin
-# Password: <password you set during init>
-```
-
-### Check Deployment Status
-
-```bash
-./tap-deploy status
-```
-
-### Uninstall
-
-```bash
-./tap-deploy destroy
-```
-
----
-
-## Command Reference
+Command reference:
 
 | Command | Description |
 |---------|-------------|
-| `./tap-deploy init` | Initialize configuration, interactive wizard generates config files |
-| `./tap-deploy plan` | Preview deployment without actual execution |
+| `./tap-deploy init` | Interactive wizard, generates all config files |
+| `./tap-deploy plan` | Preview deployment (no execution) |
 | `./tap-deploy apply` | Execute deployment |
 | `./tap-deploy status` | View deployment status |
-| `./tap-deploy destroy` | Uninstall deployment |
-| `./tap-deploy bundle` | Create offline bundle (On-Prem scenario) |
+| `./tap-deploy destroy` | Uninstall and clean up |
+| `./tap-deploy bundle` | Create offline image bundle (On-Prem) |
+| `./tap-deploy -d /path init` | Specify working directory |
 
 ---
 
-## Deployment Modes
+## Workflow
 
-### Lite Mode
+`tap-deploy` uses a **template rendering** mechanism for configuration management:
 
-**Use Case**: Local development, quick testing, demo presentations
+1. `init` phase: Collect parameters interactively → Save to `.tap-deploy.env` → Render templates into final config files
+2. `apply` phase: Read configuration → Execute deployment (Docker Compose / Terraform + Helm / Helm)
 
-**Features**: Single-node MongoDB + TapData, Docker Compose orchestration, 5-minute quick startup
+```
+init interactive wizard
+  ├─ Parameters → .tap-deploy.env (config store)
+  ├─ Templates + .tap-deploy.env → docker-compose.yaml / values.yaml / application.yml / terraform.tfvars
+  └─ Terraform init (Cloud mode)
 
-### Cloud Mode
-
-**Use Case**: Production environments on Huawei Cloud CCE, AWS EKS
-
-**Features**:
-- Automatic cloud infrastructure creation (VPC, K8s cluster, ELB/ALB, NAT gateway)
-- MongoDB 3-node replica set with cloud disk mounting
-- TapData multi-replica deployment for high availability
-
-**Huawei Cloud CCE Example**:
-```bash
-# 1. Initialize configuration (select Cloud mode → Huawei Cloud, enter AK/SK, Region, etc.)
-./tap-deploy init
-
-# 2. Execute deployment (automatically completes Terraform + Helm)
-./tap-deploy apply
-
-# 3. Get access address
-kubectl -n tapdata describe ingress tapdata-ingress | grep "kubernetes.io/elb.ip"
+apply deployment execution
+  ├─ Lite:    docker compose up -d
+  ├─ Cloud:   terraform apply → push images → helm install
+  └─ On-Prem: helm install (optional offline image loading)
 ```
 
-### On-Prem Mode
+---
 
-**Use Case**: Customer data centers, disconnected environments, internal Harbor registries
+## Configuration Management
 
-**Features**: Offline image bundle creation, automatic image loading, tagging, and pushing
+### Config File Reference
 
-**Complete Workflow**:
+| File | Generated By | Description |
+|------|-------------|-------------|
+| `.tap-deploy.env` | `init` | Core config store, source of all parameters |
+| `application.yml` | `init` | TapData application config (MongoDB connection, Java options, etc.) |
+| `agent.yml` | `init` | Agent identity config |
+| `docker-compose.yaml` | `init` (Lite) | Docker Compose orchestration file |
+| `values.yaml` | `init` (Cloud/On-Prem) | Helm deployment parameters |
+| `terraform.tfvars` | `init` (Cloud) | Terraform infrastructure variables |
+
+### Customizing Configuration
+
+**Option 1: Re-run the `init` wizard**
+
+The simplest way to change any parameter. The wizard regenerates all config files.
+
+**Option 2: Edit `.tap-deploy.env` directly**
+
+After manually editing, re-render templates or edit the generated files directly. Suitable for batch changes or automation.
+
+**Option 3: Edit generated files directly**
+
+Files like `docker-compose.yaml`, `values.yaml`, and `application.yml` are standard-format files that can be edited for deep customization. Use this for advanced parameters not covered by the `init` wizard (e.g., resource quotas, Ingress annotations, MongoDB storage engine settings).
+
+> **Note**: Re-running `init` overwrites generated config files and manual edits will be lost. Consider recording customizations in `.tap-deploy.env` or managing them through separate Helm values override files.
+
+---
+
+## Lite Mode
+
+Single-node deployment with 5-minute quick start, ideal for development, testing, and POC.
+
+**Prerequisites**: Docker 20.10+ with Docker Compose plugin, current user has Docker execution permissions, public internet access.
+
+### Init Wizard Parameters
+
+| Parameter | Env Variable | Default | Description |
+|-----------|-------------|---------|-------------|
+| TapData version | `TAP_DEPLOY_IMAGE_TAG` | `latest` | Image tag to pull from Docker Hub |
+| MongoDB port | `MONGO_HOST_PORT` | `27006` | Host port mapping for MongoDB |
+| TapData port | `TAPDATA_HOST_PORT` | `13030` | Host port mapping for TapData |
+| MongoDB username | `TAP_DEPLOY_MONGO_USER` | `root` | - |
+| MongoDB password | `TAP_DEPLOY_MONGO_PASSWORD` | `AbcDef123` | - |
+
+### Hidden Config Items
+
+The following are defined in `.tap-deploy.env` but not prompted by the `init` wizard. Edit manually to adjust:
+
+| Env Variable | Default | Description |
+|-------------|---------|-------------|
+| `TAP_DEPLOY_TZ` | `Asia/Shanghai` | Container timezone |
+| `TAP_DEPLOY_JAVA_VERSION` | `java17` | JDK version (java8 / java11 / java17) |
+| `TAP_DEPLOY_LICENSE_HOST` | - | License server address |
+
+### Deep Customization
+
+Edit `docker-compose.yaml` directly to adjust:
+- Container resource limits (default: 4 CPU / 12G memory)
+- Volume mount paths
+- Health check policies
+- Environment variables (`FRONTEND_WORKER_COUNT`, `API_WORKER_COUNT`, etc.)
+
+---
+
+## Cloud Mode
+
+Automated cloud infrastructure provisioning + Kubernetes deployment, designed for production.
+
+**Prerequisites**: Terraform 1.7+, Helm 3.14+, kubectl, Docker, cloud provider AK/SK permissions.
+
+### Deployment Flow
+
+```
+terraform apply → Create VPC / CCE(EKS) / SWR(ECR) / NAT
+       ↓
+Push images to cloud registry (SWR / ECR)
+       ↓
+Install MongoDB Community Operator
+       ↓
+helm install → Deploy TapData (MongoDB + server + engine + apiserver)
+```
+
+### Init Wizard Parameters
+
+**Common Parameters**
+
+| Parameter | Env Variable | Default | Description |
+|-----------|-------------|---------|-------------|
+| TapData version | `TAP_DEPLOY_IMAGE_TAG` | `latest` | Image tag |
+| Cloud provider | `TAP_DEPLOY_CLOUD_PROVIDER` | - | `huaweicloud` / `aws` |
+| Access Key | `TAP_DEPLOY_CLOUD_ACCESS_KEY` | - | Masked input |
+| Secret Key | `TAP_DEPLOY_CLOUD_SECRET_KEY` | - | Masked input |
+| Region | `TAP_DEPLOY_CLOUD_REGION` | `ap-southeast-1` | - |
+| Availability zones | `TAP_DEPLOY_CLOUD_AZS` | `ap-southeast-1a,ap-southeast-1b` | Comma-separated |
+| Cluster name | `TAP_DEPLOY_CLOUD_CLUSTER_NAME` | `tapdata` | K8s cluster name |
+| Node count | `TAP_DEPLOY_CLOUD_NODE_COUNT` | `3` | Worker node count |
+| MongoDB username | `TAP_DEPLOY_MONGO_USER` | `root` | - |
+| MongoDB password | `TAP_DEPLOY_MONGO_PASSWORD` | `AbcDef123` | - |
+| Helm Release | `TAP_DEPLOY_HELM_RELEASE` | `tapdata` | - |
+| Namespace | `TAP_DEPLOY_NAMESPACE` | `tapdata` | - |
+
+**Huawei Cloud Specific**
+
+| Parameter | Env Variable | Default | Description |
+|-----------|-------------|---------|-------------|
+| Node flavor | `TAP_DEPLOY_CLOUD_NODE_FLAVOR` | `s2.4xlarge.2` | [Flavor reference](https://support.huaweicloud.com/intl/zh-cn/usermanual-cce/cce_10_0719.html) |
+
+**AWS Specific**
+
+| Parameter | Env Variable | Default | Description |
+|-----------|-------------|---------|-------------|
+| Node instance type | `TAP_DEPLOY_CLOUD_NODE_INSTANCE_TYPE` | `t3.medium` | - |
+| K8s version | `TAP_DEPLOY_CLOUD_CLUSTER_VERSION` | `1.29` | - |
+
+### Automatic Registry Configuration
+
+In Cloud mode, registry information is automatically obtained after `terraform apply` — **no manual configuration needed**:
+
+- Huawei Cloud: SWR internal pull URL + external push URL + temporary AK/SK authentication
+- AWS: ECR internal pull URL + external push URL + ECR authentication
+
+Automatically written to `.tap-deploy.env` and rendered into `values.yaml` during the `apply` phase.
+
+### Ingress Configuration
+
+Each cloud provider uses a dedicated Ingress config file, automatically merged during `apply`:
+
+| Cloud Provider | File | Load Balancer |
+|---------------|------|---------------|
+| Huawei Cloud | `values-ingress-huaweicloud.yaml` | ELB (auto-created public ELB) |
+| AWS | `values-ingress-aws.yaml` | ALB (Internet-facing) |
+
+To customize Ingress (domain, TLS certificate, bandwidth, etc.), edit the corresponding `values-ingress-*.yaml` file.
+
+### Deep Customization
+
+Edit `values.yaml` directly to adjust:
+- Replica counts (`tapdata-server.replicaCount`, etc., default: 2 each)
+- Resource quotas (CPU/memory limits & requests)
+- MongoDB replica set members, storage class, storage size
+- Service type (ClusterIP / NodePort)
+- API Server enable/disable
+
+Edit `terraform.tfvars` to adjust:
+- VPC CIDR
+- Key pair name
+- Registry organization/repository name
+
+### Get Access Address
+
 ```bash
-# Online environment: Create offline bundle
+# Huawei Cloud
+kubectl describe ingress -n tapdata -l app.kubernetes.io/name=tapdata | grep 'kubernetes.io/elb.ip'
+
+# AWS
+kubectl get ingress -n tapdata
+```
+
+---
+
+## (⌛️) On-Prem Mode
+
+For customer data centers and air-gapped environments, deployed on existing Kubernetes clusters.
+
+**Prerequisites**: Helm 3.14+, kubectl, access to a K8s cluster. Offline mode requires Docker and a pre-built image bundle.
+
+### Online Deployment
+
+When the K8s cluster can access the public internet (or a private registry):
+
+```bash
+./tap-deploy init    # Select On-Prem → Non-offline
+./tap-deploy apply
+```
+
+### Offline Deployment
+
+**Build image bundle on an online machine:**
+
+```bash
 ./tap-deploy bundle --output images-bundle.tar.gz
+```
 
-# Transfer to offline environment
-scp images-bundle.tar.gz user@target-host:/opt/
+**Deploy in the offline environment:**
 
-# Offline environment: Deploy (select On-Prem mode, enter internal Harbor address)
-./tap-deploy init
+```bash
+# Load images
+docker load -i images-bundle.tar.gz
+
+# Push to internal registry
+docker tag tapdata8/tapdata:latest <harbor>/tapdata:latest
+docker push <harbor>/tapdata:latest
+
+# Deploy
+./tap-deploy init    # Select On-Prem → Offline, enter internal registry address
 ./tap-deploy apply
 ```
+
+### Init Wizard Parameters
+
+| Parameter | Env Variable | Default | Description |
+|-----------|-------------|---------|-------------|
+| TapData version | `TAP_DEPLOY_IMAGE_TAG` | `latest` | Image tag |
+| Offline mode | `TAP_DEPLOY_OFFLINE` | `false` | Set to `true` for air-gapped |
+| MongoDB username | `TAP_DEPLOY_MONGO_USER` | `root` | - |
+| MongoDB password | `TAP_DEPLOY_MONGO_PASSWORD` | `AbcDef123` | - |
+| Helm Release | `TAP_DEPLOY_HELM_RELEASE` | `tapdata` | - |
+| Namespace | `TAP_DEPLOY_NAMESPACE` | `tapdata` | - |
+| Internal registry | `TAP_DEPLOY_HARBOR_REGISTRY` | - | Required for offline mode |
+| Registry prefix | `TAP_DEPLOY_IMAGE_REGISTRY` | - | For online mode; leave empty for Docker Hub |
+
+### Deep Customization
+
+Same as Cloud mode — edit `values.yaml` directly to adjust replica counts, resource quotas, MongoDB parameters, etc.
 
 ---
 
@@ -141,72 +288,52 @@ scp images-bundle.tar.gz user@target-host:/opt/
 
 ### Resource Planning
 
-**Production**: tapdata-server/engine/apiserver 2 replicas each, MongoDB 3-node replica set
+| Component | Replicas | CPU | Memory |
+|-----------|----------|-----|--------|
+| tapdata-server | 2 | 500m ~ 2 | 2Gi ~ 4Gi |
+| tapdata-engine | 2 | 500m ~ 2 | 2Gi ~ 4Gi |
+| tapdata-apiserver | 2 | 250m ~ 1 | 1Gi ~ 2Gi |
+| MongoDB | 3-node replica set | - | - |
 
-**Storage Recommendations**:
-- Huawei Cloud: SSD (Ultra-High I/O EVS)
+### Storage
+
+- Huawei Cloud: Ultra-High I/O EVS (SSD)
 - AWS: gp3 / io2 EBS
+- Self-hosted: SSD recommended to reduce CDC latency
 
 ### High Availability
 
-- Database: 3-node replica set
-- Application: Multi-replica + load balancing
-- Rolling updates: Zero-downtime upgrades, 30s graceful shutdown
+- MongoDB 3-node replica set with automatic failover
+- Multi-replica application + load balancing
+- Zero-downtime rolling updates, 30s graceful shutdown
 
 ---
 
-## Operations
+## Troubleshooting
 
-### Upgrade
-
-```bash
-./tap-deploy apply --version <new-version>
-```
-
-Supports rolling updates with zero downtime.
-
-### Troubleshooting
-
-| Issue | Troubleshooting |
-|-------|----------------|
+| Symptom | Resolution |
+|---------|------------|
 | Pod fails to start | `kubectl -n tapdata describe pod <pod-name>` |
-| Service unreachable | Check Ingress, ELB/ALB, security groups |
-| MongoDB connection failure | `kubectl get mdb -n tapdata` |
+| Service unreachable | Check Ingress / ELB / security groups |
+| MongoDB connection failure | `kubectl get mdbc -n tapdata` |
 | License expired | Check `$TAPDATA_WORK_DIR/license.txt` |
 
 ---
 
-## Technology Stack
+## Tech Stack
 
-- **Containers**: Docker 20.10+, Docker Compose 2.0+
-- **Orchestration**: Kubernetes 1.24+, Helm 3.14+
-- **Infrastructure**: Terraform 1.7+ (Huawei Cloud CCE / AWS EKS)
-- **Database**: MongoDB 6.0+ (Community Operator managed replica sets)
-- **Architecture**: AMD64 / ARM64 (Ubuntu 24.04 base image)
+Docker 20.10+ · Kubernetes 1.24+ · Helm 3.14+ · Terraform 1.7+ · MongoDB 6.0+ · AMD64 / ARM64
 
 ---
 
 ## Important Notes
 
-- **Network**: `init` downloads config templates, `apply` pulls images (On-Prem requires offline bundle)
-- **Storage**: Use ultra-high I/O storage in production to reduce CDC latency
-- **ARM Compatibility**: All Connectors verified with ARM compilation
-- **macOS**: Ensure terminal has disk access permissions
+- `init` requires downloading config templates; `apply` requires pulling images. Prepare offline bundles in advance for air-gapped environments
+- Use ultra-high I/O storage in production to reduce CDC latency
+- All Connectors are ARM-compiled and verified
+- macOS: ensure terminal has disk access permissions
+- 30-day free trial License included by default; contact TapData team for extensions
 
 ---
 
-## License Management
-
-Containers automatically apply for License from License Server on startup (HTTPS + server authentication):
-- `valid_days`: Validity period (default 30 days)
-- `licenseType`: Type (OP = Private Deployment)
-- `engineLimit`: Engine count limit
-
-In K8s mode, pre-applied `license.txt` can be mounted via ConfigMap
-
----
-
-## More Information
-
-- **GitHub Repository**: https://github.com/tapdata/tapdata-deploy
-- **Issue Reporting**: Please submit via GitHub Issues
+[GitHub](https://github.com/tapdata/tapdata-deploy) · [Issues](https://github.com/tapdata/tapdata-deploy/issues)
