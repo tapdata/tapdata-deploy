@@ -410,7 +410,7 @@ TAP_DEPLOY_CLOUD_REGION=${TAP_DEPLOY_CLOUD_REGION:-}
 TAP_DEPLOY_CLOUD_ACCESS_KEY=${TAP_DEPLOY_CLOUD_ACCESS_KEY:-}
 TAP_DEPLOY_CLOUD_SECRET_KEY=${TAP_DEPLOY_CLOUD_SECRET_KEY:-}
 TAP_DEPLOY_CLOUD_AZS=${TAP_DEPLOY_CLOUD_AZS:-}
-TAP_DEPLOY_CLOUD_CLUSTER_NAME=${TAP_DEPLOY_CLOUD_CLUSTER_NAME:-tapdata-k8s}
+TAP_DEPLOY_CLOUD_CLUSTER_NAME=${TAP_DEPLOY_CLOUD_CLUSTER_NAME:-tapdata}
 TAP_DEPLOY_CLOUD_NODE_COUNT=${TAP_DEPLOY_CLOUD_NODE_COUNT:-3}
 TAP_DEPLOY_CLOUD_NEW_CLUSTER=${TAP_DEPLOY_CLOUD_NEW_CLUSTER:-true}
 TAP_DEPLOY_CLOUD_REGISTRY_INNER_PULL_URL=${TAP_DEPLOY_CLOUD_REGISTRY_INNER_PULL_URL:-}
@@ -698,7 +698,7 @@ _init_cloud() {
   prompt_input "Availability zones (comma-separated)" "$default_azs" TAP_DEPLOY_CLOUD_AZS
 
   # Cluster config
-  prompt_input "Cluster name" "tapdata-k8s" TAP_DEPLOY_CLOUD_CLUSTER_NAME
+  prompt_input "Cluster name" "tapdata" TAP_DEPLOY_CLOUD_CLUSTER_NAME
   prompt_input "Worker node count" "3" TAP_DEPLOY_CLOUD_NODE_COUNT
 
   if [ "$TAP_DEPLOY_CLOUD_PROVIDER" = "huaweicloud" ]; then
@@ -835,7 +835,7 @@ _render_cloud_configs() {
     done
   fi
 
-  CLOUD_CLUSTER_NAME="${TAP_DEPLOY_CLOUD_CLUSTER_NAME:-tapdata-k8s}"
+  CLOUD_CLUSTER_NAME="${TAP_DEPLOY_CLOUD_CLUSTER_NAME:-tapdata}"
   CLOUD_NODE_COUNT="${TAP_DEPLOY_CLOUD_NODE_COUNT:-3}"
 
   if [ "$provider" = "huaweicloud" ]; then
@@ -883,8 +883,8 @@ _render_helm_values() {
   TZ="${TAP_DEPLOY_TZ:-Asia/Shanghai}"
   LICENSE_HOST="${TAP_DEPLOY_LICENSE_HOST:-}"
   APISERVER_ENABLED="${APISERVER_ENABLED:-true}"
-  INGRESS_ENABLED="${INGRESS_ENABLED:-false}"
-  INGRESS_CLASS_NAME="${INGRESS_CLASS_NAME:-}"
+  # Note: Ingress configuration is now handled by cloud-specific values files
+  # (values-ingress-huaweicloud.yaml, values-ingress-aws.yaml, etc.)
 
   # Replica counts
   SERVER_REPLICA_COUNT="${SERVER_REPLICA_COUNT:-2}"
@@ -896,18 +896,21 @@ _render_helm_values() {
   local cloud_registry_inner="${TAP_DEPLOY_CLOUD_REGISTRY_INNER_PULL_URL:-}"
   
   if [ "$TAP_DEPLOY_MODE" = "cloud" ] && [ -n "$cloud_registry_inner" ]; then
-    # Cloud mode: use inner pull URL from Terraform outputs
-    # Images were pushed with specific version tag to cloud registry
-    SERVER_IMAGE_REPOSITORY="${cloud_registry_inner}/tapdata"
-    ENGINE_IMAGE_REPOSITORY="${cloud_registry_inner}/tapdata"
-    APISERVER_IMAGE_REPOSITORY="${cloud_registry_inner}/tapdata"
-    KUBECTL_IMAGE_REPOSITORY="${cloud_registry_inner}/kubectl"
+    # Cloud mode: image.repository should only contain image name, not full URL
+    # global.imageRegistry will provide the registry URL
+    # Helm template will concatenate: global.imageRegistry/image.repository:tag
+    SERVER_IMAGE_REPOSITORY="tapdata"
+    ENGINE_IMAGE_REPOSITORY="tapdata"
+    APISERVER_IMAGE_REPOSITORY="tapdata"
+    KUBECTL_IMAGE_REPOSITORY="kubectl"
   elif [ -n "$IMAGE_REGISTRY" ]; then
-    SERVER_IMAGE_REPOSITORY="${IMAGE_REGISTRY}/tapdata/tapdata"
-    ENGINE_IMAGE_REPOSITORY="${IMAGE_REGISTRY}/tapdata/tapdata"
-    APISERVER_IMAGE_REPOSITORY="${IMAGE_REGISTRY}/tapdata/tapdata"
-    KUBECTL_IMAGE_REPOSITORY="${IMAGE_REGISTRY}/tapdata/kubectl"
+    # On-Prem mode: same logic - only image name
+    SERVER_IMAGE_REPOSITORY="tapdata/tapdata"
+    ENGINE_IMAGE_REPOSITORY="tapdata/tapdata"
+    APISERVER_IMAGE_REPOSITORY="tapdata/tapdata"
+    KUBECTL_IMAGE_REPOSITORY="tapdata/kubectl"
   else
+    # Lite mode: use Docker Hub default
     SERVER_IMAGE_REPOSITORY="tapdata8/tapdata"
     ENGINE_IMAGE_REPOSITORY="tapdata8/tapdata"
     APISERVER_IMAGE_REPOSITORY="tapdata8/tapdata"
@@ -923,8 +926,6 @@ _render_helm_values() {
     SERVER_NODEPORT_CONFIG="nodePort: 30303"
     APISERVER_SERVICE_TYPE="NodePort"
     APISERVER_NODEPORT_CONFIG="nodePort: 30803"
-    INGRESS_ENABLED="true"
-    INGRESS_CLASS_NAME="cce"
     MONGODB_STORAGE_CLASS="ssd"
   else
     SERVER_SERVICE_TYPE="ClusterIP"
@@ -968,7 +969,7 @@ _render_helm_values() {
     # Set imagePullSecrets array for deployment references
     # Huawei Cloud CCE: use both default-secret (cloud platform) and custom registry auth
     # This provides dual insurance - either secret can be used to pull images from SWR
-    IMAGE_PULL_SECRETS_ARRAY="[\"default-secret\", \"${IMAGE_PULL_SECRET_NAME}\"]"
+    IMAGE_PULL_SECRETS_ARRAY="[{\"name\": \"default-secret\"}, {\"name\": \"${IMAGE_PULL_SECRET_NAME}\"}]"
     
   elif [ -n "$IMAGE_REGISTRY" ]; then
     IMAGE_PULL_SECRET_ENABLED="true"
@@ -978,7 +979,7 @@ _render_helm_values() {
     IMAGE_PULL_SECRET_PASSWORD="${TAP_DEPLOY_CLOUD_SECRET_KEY:-${IMAGE_PULL_SECRET_PASSWORD:-}}"
     
     # Set imagePullSecrets array for deployment references
-    IMAGE_PULL_SECRETS_ARRAY="[\"${IMAGE_PULL_SECRET_NAME}\"]"
+    IMAGE_PULL_SECRETS_ARRAY="[{\"name\": \"${IMAGE_PULL_SECRET_NAME}\"}]"
     
   else
     IMAGE_PULL_SECRET_ENABLED="false"
@@ -1005,6 +1006,15 @@ _render_helm_values() {
     cp -r "$k8s_dir" "$WORK_DIR/deploy-on-kubernetes"
     # Remove template file from the copy
     rm -f "$WORK_DIR/deploy-on-kubernetes/values.yaml.tmpl"
+    
+    # Copy cloud-specific ingress values files if they exist
+    if [ "$TAP_DEPLOY_MODE" = "cloud" ] && [ -n "${TAP_DEPLOY_CLOUD_PROVIDER:-}" ]; then
+      local ingress_file="values-ingress-${TAP_DEPLOY_CLOUD_PROVIDER}.yaml"
+      if [ -f "$k8s_dir/$ingress_file" ]; then
+        cp "$k8s_dir/$ingress_file" "$WORK_DIR/deploy-on-kubernetes/"
+        log_info "Copied cloud-specific ingress config: $ingress_file"
+      fi
+    fi
   fi
 }
 
@@ -1342,7 +1352,7 @@ _apply_cloud() {
   log_step "Phase 5: Install MongoDB Community Operator"
   helm repo add mongodb https://mongodb.github.io/helm-charts
   helm repo update
-  helm install community-operator mongodb/community-operator \
+  helm upgrade --install community-operator mongodb/community-operator \
     --namespace mongodb \
     --create-namespace \
     --set operator.watchNamespace="*"
@@ -1382,7 +1392,7 @@ _apply_onprem_online() {
   log_step "Step 1: Install MongoDB Community Operator"
   helm repo add mongodb https://mongodb.github.io/helm-charts
   helm repo update
-  helm install community-operator mongodb/community-operator \
+  helm upgrade --install community-operator mongodb/community-operator \
     --namespace mongodb \
     --create-namespace \
     --set operator.watchNamespace="*"
@@ -1434,7 +1444,7 @@ _apply_onprem_offline() {
   # Use the offline chart if available
   local operator_chart="$WORK_DIR/charts/mongodb-community-operator"
   if [ -d "$operator_chart" ]; then
-    helm install community-operator "$operator_chart" \
+    helm upgrade --install community-operator "$operator_chart" \
       --namespace mongodb \
       --create-namespace \
       --set operator.watchNamespace="*" \
@@ -1442,7 +1452,7 @@ _apply_onprem_offline() {
   else
     log_warn "MongoDB Operator offline chart not found, attempting online install"
     helm repo add mongodb https://mongodb.github.io/helm-charts
-    helm install community-operator mongodb/community-operator \
+    helm upgrade --install community-operator mongodb/community-operator \
       --namespace mongodb \
       --create-namespace \
       --set operator.watchNamespace="*"
@@ -1476,10 +1486,27 @@ _helm_install() {
     log_error "values.yaml not found in $WORK_DIR. Run '${DEPLOY_FILENAME} init' first."
   fi
 
-  helm upgrade --install "$release" "$chart_dir" \
-    --namespace "$namespace" \
-    --create-namespace \
-    -f "$values_file"
+  # Build helm install command with cloud-specific ingress values
+  local helm_cmd="helm upgrade --install \"$release\" \"$chart_dir\" \\
+    --namespace \"$namespace\" \\
+    --create-namespace \\
+    -f \"$values_file\""
+  
+  # Add cloud-specific ingress values file if exists
+  if [ "$TAP_DEPLOY_MODE" = "cloud" ] && [ -n "${TAP_DEPLOY_CLOUD_PROVIDER:-}" ]; then
+    local ingress_values_file="$WORK_DIR/deploy-on-kubernetes/values-ingress-${TAP_DEPLOY_CLOUD_PROVIDER}.yaml"
+    if [ -f "$ingress_values_file" ]; then
+      log_info "Using cloud-specific ingress configuration: values-ingress-${TAP_DEPLOY_CLOUD_PROVIDER}.yaml"
+      helm_cmd="$helm_cmd \\
+    -f \"$ingress_values_file\""
+    else
+      log_warn "Cloud-specific ingress values file not found: $ingress_values_file"
+      log_warn "Ingress will use default configuration from values.yaml"
+    fi
+  fi
+
+  # Execute helm install
+  eval "$helm_cmd"
 
   log_info "Showing deployed pods..."
   kubectl get pods -n "$namespace" || true
