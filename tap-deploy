@@ -1259,6 +1259,104 @@ _pull_tag_push() {
   log_info "Pushed: $target"
 }
 
+# Push MongoDB Community Operator dependency images to registry
+_push_mongodb_images_to_registry() {
+  local push_url="$1"
+
+  log_info "Pushing MongoDB Community Operator dependency images..."
+
+  # MongoDB Community Operator dependency images (with specific versions)
+  local mongodb_operator_img="quay.io/mongodb/mongodb-kubernetes-operator:0.13.0"
+  local mongodb_agent_img="quay.io/mongodb/mongodb-agent-ubi:108.0.6.8796-1"
+  local mongodb_version_upgrade_img="quay.io/mongodb/mongodb-kubernetes-operator-version-upgrade-post-start-hook:1.0.10"
+  local mongodb_readiness_probe_img="quay.io/mongodb/mongodb-kubernetes-readinessprobe:1.0.23"
+  local mongodb_server_img="docker.io/mongodb/mongodb-community-server:6.0.5-ubi8"
+
+  # Target image names in registry
+  local mongodb_operator_target="${push_url}/mongodb-kubernetes-operator:0.13.0"
+  local mongodb_agent_target="${push_url}/mongodb-agent-ubi:108.0.6.8796-1"
+  local mongodb_version_upgrade_target="${push_url}/mongodb-kubernetes-operator-version-upgrade-post-start-hook:1.0.10"
+  local mongodb_readiness_probe_target="${push_url}/mongodb-kubernetes-readinessprobe:1.0.23"
+  local mongodb_server_target="${push_url}/mongodb-community-server:6.0.5-ubi8"
+
+  log_info "Processing MongoDB operator image..."
+  _pull_tag_push "$mongodb_operator_img" "$mongodb_operator_img" "$mongodb_operator_target"
+
+  log_info "Processing MongoDB agent image..."
+  _pull_tag_push "$mongodb_agent_img" "$mongodb_agent_img" "$mongodb_agent_target"
+
+  log_info "Processing MongoDB version upgrade hook image..."
+  _pull_tag_push "$mongodb_version_upgrade_img" "$mongodb_version_upgrade_img" "$mongodb_version_upgrade_target"
+
+  log_info "Processing MongoDB readiness probe image..."
+  _pull_tag_push "$mongodb_readiness_probe_img" "$mongodb_readiness_probe_img" "$mongodb_readiness_probe_target"
+
+  log_info "Processing MongoDB community server image..."
+  _pull_tag_push "$mongodb_server_img" "$mongodb_server_img" "$mongodb_server_target"
+
+  log_info "All MongoDB images pushed to registry successfully"
+}
+
+# Install MongoDB Community Operator with optional registry configuration
+# When registry_url is provided, all MongoDB images will be pulled from that registry
+_install_mongodb_operator() {
+  local registry_url="${1:-}"
+  local pull_secret_name="${2:-}"
+  local pull_secret_registry="${3:-}"
+  local pull_secret_username="${4:-}"
+  local pull_secret_password="${5:-}"
+  local is_huaweicloud="${6:-false}"
+
+  check_cmd helm
+  check_cmd kubectl
+
+  log_step "Install MongoDB Community Operator"
+
+  helm repo add mongodb https://mongodb.github.io/helm-charts 2>/dev/null || true
+  helm repo update
+
+  # Build helm install set args
+  local helm_set_args="--set operator.watchNamespace=\"*\""
+
+  if [ -n "$registry_url" ]; then
+    log_info "Configuring MongoDB operator to use image registry: $registry_url"
+    helm_set_args="${helm_set_args} --set registry.operator=${registry_url}"
+    helm_set_args="${helm_set_args} --set registry.agent=${registry_url}"
+    helm_set_args="${helm_set_args} --set registry.versionUpgradeHook=${registry_url}"
+    helm_set_args="${helm_set_args} --set registry.readinessProbe=${registry_url}"
+    helm_set_args="${helm_set_args} --set mongodb.repo=${registry_url}"
+  fi
+
+  # Create imagePullSecret in mongodb namespace if credentials are provided
+  if [ -n "$pull_secret_name" ] && [ -n "$pull_secret_registry" ] && [ -n "$pull_secret_username" ] && [ -n "$pull_secret_password" ]; then
+    log_info "Creating imagePullSecret '$pull_secret_name' in mongodb namespace..."
+    kubectl create namespace mongodb 2>/dev/null || true
+    kubectl create secret docker-registry "$pull_secret_name" \
+      --namespace mongodb \
+      --docker-server="$pull_secret_registry" \
+      --docker-username="$pull_secret_username" \
+      --docker-password="$pull_secret_password" \
+      --dry-run=client -o yaml 2>/dev/null | kubectl apply -f -
+
+    # Configure imagePullSecrets for the operator pod
+    if [ "$is_huaweicloud" = "true" ]; then
+      helm_set_args="${helm_set_args} --set imagePullSecrets[0].name=default-secret"
+      helm_set_args="${helm_set_args} --set imagePullSecrets[1].name=${pull_secret_name}"
+    else
+      helm_set_args="${helm_set_args} --set imagePullSecrets[0].name=${pull_secret_name}"
+    fi
+  fi
+
+  eval "helm upgrade --install community-operator mongodb/community-operator \
+    --namespace mongodb \
+    --create-namespace \
+    ${helm_set_args}"
+
+  # Wait for operator to be ready
+  log_info "Waiting for MongoDB Operator to be ready..."
+  kubectl wait --for=condition=ready pod -l name=mongodb-kubernetes-operator -n mongodb --timeout=120s || true
+}
+
 _apply_cloud() {
   local provider="${TAP_DEPLOY_CLOUD_PROVIDER:-huaweicloud}"
 
@@ -1345,21 +1443,46 @@ _apply_cloud() {
   log_step "Phase 4: Push images to cloud registry"
   _push_images_to_cloud_registry "$registry_external_push_url" "$registry_login_command" "$provider" "$registry_region"
 
+  # Phase 4.5: Push MongoDB images to cloud registry
+  log_step "Phase 4.5: Push MongoDB images to cloud registry"
+  _push_mongodb_images_to_registry "$registry_external_push_url"
+
   # Set image registry for Helm values rendering (use inner pull URL for K8s pods)
   TAP_DEPLOY_IMAGE_REGISTRY="$registry_inner_pull_url"
 
-  # Phase 5: Install MongoDB Operator
-  log_step "Phase 5: Install MongoDB Community Operator"
-  helm repo add mongodb https://mongodb.github.io/helm-charts
-  helm repo update
-  helm upgrade --install community-operator mongodb/community-operator \
-    --namespace mongodb \
-    --create-namespace \
-    --set operator.watchNamespace="*"
+  # Compute imagePullSecret parameters for MongoDB operator installation
+  local mdb_pull_secret_name=""
+  local mdb_pull_secret_registry=""
+  local mdb_pull_secret_username=""
+  local mdb_pull_secret_password=""
 
-  # Wait for operator to be ready
-  log_info "Waiting for MongoDB Operator to be ready..."
-  kubectl wait --for=condition=ready pod -l name=mongodb-kubernetes-operator -n mongodb --timeout=120s || true
+  if [ -n "$registry_inner_pull_url" ]; then
+    mdb_pull_secret_name="${TAP_DEPLOY_IMAGE_PULL_SECRET_NAME:-tapdata-registry-auth}"
+    mdb_pull_secret_registry="$registry_inner_pull_url"
+
+    local auth_login_cmd="${TAP_DEPLOY_CLOUD_REGISTRY_AUTH_DOCKER_LOGIN:-}"
+    if [ -n "$auth_login_cmd" ]; then
+      mdb_pull_secret_username=$(echo "$auth_login_cmd" | grep -o '\-u [^ ]*' | awk '{print $2}' || echo "")
+      mdb_pull_secret_password=$(echo "$auth_login_cmd" | grep -o '\-p [^ ]*' | awk '{print $2}' || echo "")
+      if [ -z "$mdb_pull_secret_username" ] || [ -z "$mdb_pull_secret_password" ]; then
+        mdb_pull_secret_username="${TAP_DEPLOY_CLOUD_ACCESS_KEY:-}"
+        mdb_pull_secret_password="${TAP_DEPLOY_CLOUD_SECRET_KEY:-}"
+      fi
+    else
+      mdb_pull_secret_username="${TAP_DEPLOY_CLOUD_ACCESS_KEY:-}"
+      mdb_pull_secret_password="${TAP_DEPLOY_CLOUD_SECRET_KEY:-}"
+    fi
+  fi
+
+  # Phase 5: Install MongoDB Operator (with registry pointing to cloud registry)
+  local is_huaweicloud="false"
+  if [ "$provider" = "huaweicloud" ]; then
+    is_huaweicloud="true"
+  fi
+  _install_mongodb_operator "$registry_inner_pull_url" \
+    "$mdb_pull_secret_name" "$mdb_pull_secret_registry" \
+    "$mdb_pull_secret_username" "$mdb_pull_secret_password" \
+    "$is_huaweicloud"
 
   # Phase 6: Re-render Helm values with cloud registry info and deploy
   log_step "Phase 6: Deploy TapData (Helm)"
@@ -1389,15 +1512,15 @@ _apply_onprem_online() {
   log_step "On-Prem online deployment"
 
   # Step 1: Install MongoDB Operator
-  log_step "Step 1: Install MongoDB Community Operator"
-  helm repo add mongodb https://mongodb.github.io/helm-charts
-  helm repo update
-  helm upgrade --install community-operator mongodb/community-operator \
-    --namespace mongodb \
-    --create-namespace \
-    --set operator.watchNamespace="*"
-
-  kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mongodb-community-operator -n mongodb --timeout=120s || true
+  # When a custom image registry is configured, install operator with registry settings
+  if [ -n "${TAP_DEPLOY_IMAGE_REGISTRY:-}" ]; then
+    log_info "Custom image registry configured: $TAP_DEPLOY_IMAGE_REGISTRY"
+    log_info "Pushing MongoDB images to registry and installing operator with registry settings..."
+    _push_mongodb_images_to_registry "$TAP_DEPLOY_IMAGE_REGISTRY"
+    _install_mongodb_operator "$TAP_DEPLOY_IMAGE_REGISTRY"
+  else
+    _install_mongodb_operator
+  fi
 
   # Step 2: Deploy TapData
   log_step "Step 2: Deploy TapData (Helm)"
@@ -1438,25 +1561,11 @@ _apply_onprem_offline() {
     log_info "Pushed: $target"
   done
 
-  # Step 3: Install MongoDB Operator
-  log_step "Step 3: Install MongoDB Community Operator"
-  # In offline mode, the operator image should already be loaded
-  # Use the offline chart if available
-  local operator_chart="$WORK_DIR/charts/mongodb-community-operator"
-  if [ -d "$operator_chart" ]; then
-    helm upgrade --install community-operator "$operator_chart" \
-      --namespace mongodb \
-      --create-namespace \
-      --set operator.watchNamespace="*" \
-      --set image.repository="$registry/mongodb/community-operator"
-  else
-    log_warn "MongoDB Operator offline chart not found, attempting online install"
-    helm repo add mongodb https://mongodb.github.io/helm-charts
-    helm upgrade --install community-operator mongodb/community-operator \
-      --namespace mongodb \
-      --create-namespace \
-      --set operator.watchNamespace="*"
-  fi
+  # Step 2.5: Push MongoDB images to internal registry
+  _push_mongodb_images_to_registry "$registry"
+
+  # Step 3: Install MongoDB Operator (with registry pointing to internal registry)
+  _install_mongodb_operator "$registry"
 
   # Step 4: Deploy TapData
   log_step "Step 4: Deploy TapData (Helm)"
@@ -1719,6 +1828,12 @@ cmd_bundle() {
     "mongo:6.0"
     "mongodb/community-operator:latest"
     "bitnami/kubectl:latest"
+    # MongoDB Community Operator dependency images
+    "quay.io/mongodb/mongodb-kubernetes-operator:0.13.0"
+    "quay.io/mongodb/mongodb-agent-ubi:108.0.6.8796-1"
+    "quay.io/mongodb/mongodb-kubernetes-operator-version-upgrade-post-start-hook:1.0.10"
+    "quay.io/mongodb/mongodb-kubernetes-readinessprobe:1.0.23"
+    "docker.io/mongodb/mongodb-community-server:6.0.5-ubi8"
   )
 
   # Pull and save images
@@ -1916,7 +2031,11 @@ main() {
   fi
 
   # Set positional parameters to the filtered args (without -d and its value)
-  set -- "${new_args[@]}"
+  if [ ${#new_args[@]} -gt 0 ]; then
+    set -- "${new_args[@]}"
+  else
+    set --
+  fi
 
   local command="${1:-}"
   shift || true
