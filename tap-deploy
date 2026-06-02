@@ -469,7 +469,7 @@ download_templates() {
     log_info "Found existing archive: $archive_path, using it directly"
   else
     log_step "Downloading configuration templates from $DEPLOY_CONFIG_URL"
-    curl -fSL -o "$archive_path" "$DEPLOY_CONFIG_URL" || {
+    curl -fSL -H "Cache-Control: no-cache" -o "$archive_path" "$DEPLOY_CONFIG_URL" || {
       rm -f "$archive_path"
       log_error "Failed to download templates from $DEPLOY_CONFIG_URL"
     }
