@@ -19,6 +19,7 @@ if [ -n "$REGISTRY_URL" ]; then
   HELM_SET_ARGS="${HELM_SET_ARGS} --set registry.readinessProbe=${REGISTRY_URL}"
   HELM_SET_ARGS="${HELM_SET_ARGS} --set mongodb.repo=${REGISTRY_URL}"
 fi
+HELM_SET_ARGS="${HELM_SET_ARGS} --set mongodb.imageType=ubi8"
 
 eval "helm install community-operator mongodb/community-operator \
   --namespace mongodb \

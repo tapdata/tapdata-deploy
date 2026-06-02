@@ -66,7 +66,7 @@ mongodb:
   replicaSet:
     name: tapdata-mongodb
     members: 3
-    version: "6.0.5"
+    version: "6.0.5-ubi8"
     security:
       authentication:
         modes:
