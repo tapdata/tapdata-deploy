@@ -27,13 +27,16 @@ spec:
     {{- end }}
   additionalMongodConfig:
     {{- toYaml .Values.replicaSet.additionalMongodConfig | nindent 4 }}
-  {{- if .Values.global.imagePullSecrets }}
+  {{/*{{- if or .Values.global.imagePullSecrets .Values.global.imageRegistry }}
   podSpec:
     podTemplate:
       spec:
+        serviceAccountName: mongodb-database
+        {{- if .Values.global.imagePullSecrets }}
         imagePullSecrets:
           {{- toYaml .Values.global.imagePullSecrets | nindent 10 }}
-  {{- end }}
+        {{- end }}
+  {{- end }}*/}}
   statefulSet:
     spec:
       volumeClaimTemplates:

@@ -1270,7 +1270,7 @@ _push_mongodb_images_to_registry() {
   local mongodb_agent_img="quay.io/mongodb/mongodb-agent-ubi:108.0.6.8796-1"
   local mongodb_version_upgrade_img="quay.io/mongodb/mongodb-kubernetes-operator-version-upgrade-post-start-hook:1.0.10"
   local mongodb_readiness_probe_img="quay.io/mongodb/mongodb-kubernetes-readinessprobe:1.0.23"
-  local mongodb_server_img="docker.io/mongodb/mongodb-community-server:6.0.5-ubi8"
+  local mongodb_server_img="quay.io/mongodb/mongodb-community-server:6.0.5-ubi8"
 
   # Target image names in registry
   local mongodb_operator_target="${push_url}/mongodb-kubernetes-operator:0.13.0"
@@ -1326,6 +1326,7 @@ _install_mongodb_operator() {
     helm_set_args="${helm_set_args} --set registry.readinessProbe=${registry_url}"
     helm_set_args="${helm_set_args} --set mongodb.repo=${registry_url}"
   fi
+  helm_set_args="${helm_set_args} --set mongodb.imageType=ubi8"
 
   # Create imagePullSecret in mongodb namespace if credentials are provided
   if [ -n "$pull_secret_name" ] && [ -n "$pull_secret_registry" ] && [ -n "$pull_secret_username" ] && [ -n "$pull_secret_password" ]; then
